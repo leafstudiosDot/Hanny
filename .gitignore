@@ -1,1 +1,18 @@
 .venv
+
+# Generated model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Model exports (keep in a separate model repository)
+*.safetensors
+
+# Training artifacts
+/checkpoints/
+/runs/
+/outputs/
+
+# Local training data
+/data/
+data_dirs.txt
