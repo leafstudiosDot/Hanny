@@ -12,6 +12,7 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -27,6 +28,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--run-name", type=str, default="hanny",
+                    help="base name for this run's checkpoint file")
 parser.add_argument("--steps", type=int, default=3000)
 parser.add_argument("--eval-every", type=int, default=250)
 parser.add_argument("--prompt", type=str, default="def ")
@@ -42,14 +45,32 @@ DROPOUT = 0.1    # randomly switches off units while training to reduce memorizi
 BATCH = 64
 LR = 1e-3
 
-# Checkpoints live in a checkpoints/ folder next to this script, not in the project root
+# Checkpoints live in a checkpoints/ folder next to this script, not in the project root.
+# Every run writes its OWN file (hanny_m1_1_run001.pt, run002, ...) instead of overwriting a
+# shared name, so earlier runs stay loadable and can be compared later.
 CKPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
-CKPT_PATH = os.path.join(CKPT_DIR, "rowboat_m1_1.pt")
 os.makedirs(CKPT_DIR, exist_ok=True)
+
+
+def free_run_path(name):
+    """First unused checkpoints/<name>_runNNN.pt, so no run ever clobbers an older one."""
+    taken = set()
+    for filename in os.listdir(CKPT_DIR):
+        m = re.fullmatch(re.escape(name) + r"_run(\d+)\.pt", filename)
+        if m:
+            taken.add(int(m.group(1)))
+    n = 1
+    while n in taken:
+        n += 1
+    return os.path.join(CKPT_DIR, f"{name}_run{n:03d}.pt")
+
+
+CKPT_PATH = free_run_path(args.run_name)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(1337)
 print("device:", device)
+print("saving this run to:", CKPT_PATH)
 
 # 1. Data
 VAL_MODULE = tarfile  # never trained on: gives an honest score
@@ -178,7 +199,12 @@ for step in range(args.steps + 1):
         marker = ""
         if losses["val"] < best_val:
             best_val = losses["val"]
-            torch.save({"model": model.state_dict(), "chars": chars}, CKPT_PATH)
+            # Stored alongside the weights so an old run file explains itself later
+            torch.save({"model": model.state_dict(), "chars": chars, "step": step,
+                        "val_loss": best_val,
+                        "config": {"run_name": args.run_name, "steps": args.steps, "block": BLOCK,
+                                   "n_embd": N_EMBD, "n_head": N_HEAD, "n_layer": N_LAYER,
+                                   "dropout": DROPOUT, "batch": BATCH, "lr": LR}}, CKPT_PATH)
             marker = "  <- best so far, saved"
         print(f"step {step:5d} | train {losses['train']:.3f} | val {losses['val']:.3f} "
               f"| {time.time() - t0:5.0f}s{marker}")
@@ -189,12 +215,13 @@ for step in range(args.steps + 1):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
 
-# 4. Generate from the BEST checkpoint (not necessarily the last step)
-ckpt = torch.load("hanny-m1_1.pt", map_location=device)
+# 4. Generate from the BEST checkpoint of THIS run (not necessarily the last step)
+ckpt = torch.load(CKPT_PATH, map_location=device)
 model.load_state_dict(ckpt["model"])
 model.eval()
 start = torch.tensor([[stoi[c] for c in args.prompt]], dtype=torch.long, device=device)
 out = model.generate(start, 600, args.temperature)[0].tolist()
 print(f"\nbest val loss: {best_val:.3f}")
+print("checkpoint:", CKPT_PATH)
 print("\n- output -")
 print("".join(itos[i] for i in out))
