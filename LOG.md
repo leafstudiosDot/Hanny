@@ -109,17 +109,120 @@ about 0.01**.
   clean baseline: re-run M1's exact config once and that curve is the number
   every later milestone is measured against.
 
-### Next: M3 — use the fixed measurement to change one thing at a time
+### Next: M3 — the token-level line
 
-In priority order, now that changes can be *seen*:
+M3 turned out to be a much bigger decision than "fix the corpus imbalance."
+Re-read the brief: the target is a GLM-5-class coding agent. That is
+unreachable (GLM-5 is 744B parameters / 40B active on 28.5T tokens; Hanny is
+0.9M on ~10M). So the route is **fine-tune an existing small open model**, and
+M3 establishes the thing fine-tuning is measured against.
 
-1. Fix the corpus imbalance: `!`-exclude the vendored library and SDK folders
-   listed in `data_report.txt`, raise `--max-chars`, re-measure. Expect val
-   loss to go *up* and the samples to get *more like your own code* — that
-   trade is the point.
-2. Then, and only then, scale the model. The 1650's 4GB is nearly idle on a
-   900k-parameter model; `N_LAYER` 4→8 and `BLOCK` 128→256 is roughly a 5×
-   budget increase and fits.
+---
+
+## M3 — real tokenizer, real baseline
+
+**Status: done.**
+
+### What was decided, and why
+
+| Decision | Answer | Reason |
+| --- | --- | --- |
+| Base model | `Qwen/Qwen3.5-0.8B` | Apache-2.0 (publishable), ungated, 752M params |
+| Why not `Qwen3-Coder-1.5B` | **it does not exist** | Qwen retired the small Coder line — checked before recommending |
+| Char-level vs token-level | token-level | ~2.9 chars/token, so a context window covers ~3x more code |
+| Hardware | Kaggle T4 ×2 primary, 1650 for dev | see "what the hardware forced" below |
+
+The decisive discovery: **its chat template already implements tool/function
+calling.** So M5 does not have to teach a small model the tool-call protocol
+from zero — it only has to teach it *our* tools. That one fact is worth more to
+the agent goal than any amount of extra pretraining.
+
+### Architecture, measured rather than guessed
+
+```
+Qwen3_5ForCausalLM — 752M params total, 1.50 GB in fp16
+  text:  24 layers | hidden 1024 | 8 query heads, 2 KV heads (GQA 4:1)
+         head_dim 256 | intermediate 3584 | context 262144 | tied embeddings
+  vocab: 248,320          <- 40% of the model is this embedding table
+  also carries a vision tower (hidden 768) that a text coding agent never uses
+```
+
+The 248k vocabulary is the number that shaped everything after it.
+
+### What the hardware forced
+
+Cross-entropy over 248k classes makes the **logits** the memory bottleneck, not
+the weights. Measured peak on the 4GB card:
+
+| batch × seq | peak VRAM | result |
+| --- | --- | --- |
+| 1 × 512 | 2.84 GB | safe |
+| 1 × 1024 | 4.12 GB | over budget |
+| 2 × 1024 | — | OOM |
+| 4 × 1024 | — | OOM |
+
+**Conclusion: the 1650 can evaluate this model at batch 1 / seq 512, and cannot
+train it.** That settles the Kaggle question — not as a preference, but because
+the card physically cannot hold the optimizer states.
+
+Two more findings, both pointing the same way:
+
+- Qwen3.5's layers need `flash-linear-attention` for its gated-delta-rule
+  path. Without it transformers prints a warning and falls back to a correct
+  but **much slower** reference implementation.
+- `bitsandbytes` (needed for 4-bit QLoRA in M4) is a CUDA extension that
+  generally fails to build on Windows.
+
+Both are Linux-friendly. Training on Kaggle is not a workaround here, it is
+the only sane path.
+
+### The baseline
+
+`baseline.py` scores the **untouched** model on the same 215 held-out files,
+same fixed-window method as M2, and writes `baseline.json`:
+
+```
+loss         1.3240 +- 0.0608
+perplexity   3.758
+2.89 chars per token | 899,874 val tokens | 64 windows x 512 tokens | 146s
+```
+
+**This is the number M4 has to beat.** It matters that the reference point is
+not `ln(vocab)` (= 12.42). Fine-tuning does not teach a model to code — this
+one already can. It teaches it *this codebase's* idioms. Perplexity 3.76 means
+the model weighs ~4 candidate tokens on average before getting it right. There
+is real room to move, and there is no way to prove you moved it without a
+number taken *before* you started.
+
+### Problems found and fixed
+
+1. **`transformers` 5.x renamed `torch_dtype=` to `dtype=`.** Caught by
+   reading the installed source rather than writing from memory; the old kwarg
+   is gone.
+2. **The M2 console fix was copy-pasted and immediately needed again** in
+   `baseline.py`. Centralised into `utf8console.py`, imported by every entry
+   point. The failure mode is nasty because the error surfaces at *flush* time:
+   the script runs to completion, saves everything, then exits 1 on the final
+   print. It looks like a crash in code that succeeded.
+3. **`std(ddof=1)` on a single window returns NaN**, which would have written a
+   null noise floor into `baseline.json` without complaining. Now rejected at
+   argument-check time.
+4. A PowerShell pipeline artifact briefly looked like a Python exit-code
+   failure. It was not — the script exits 0. Worth recording so it is not
+   re-investigated later.
+
+### Deliberately not done yet
+
+`peft`, `trl` and `bitsandbytes` are **not installed**. They belong to M4 and
+pull CUDA extensions that fail on Windows; installing them here would produce
+a broken half-working environment and a confusing first error on Kaggle.
+
+### Next: M4 — LoRA fine-tune against this baseline
+
+Run on Kaggle T4. Success is not "it trained" — it is **baseline.json's 1.3240
+going down**, measured with the identical window method, and the size of the
+drop clearing the noise floor. The noise floor on this eval is ±0.06, so a
+drop smaller than ~0.12 is not evidence of anything.
 
 ---
 

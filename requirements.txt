@@ -3,3 +3,25 @@ matplotlib
 tensorboard
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.11.0+cu128
+
+# --- M3: token-level fine-tuning line (baseline.py) ---
+# transformers 5.x renamed the dtype kwarg on from_pretrained: it is `dtype=`
+# now, and `torch_dtype=` is gone. Pinned so that rename cannot silently
+# change behaviour between machines.
+transformers==5.20.0
+accelerate==1.15.0
+huggingface-hub==2.2.0
+tokenizers==0.23.3
+safetensors==0.8.0
+
+# --- M4 (not installed yet, listed so the plan is explicit) ---
+# peft        -- LoRA adapters, the fine-tuning method M4 uses
+# trl         -- SFTTrainer, so we do not hand-write a training loop
+# bitsandbytes -- 4-bit quantised base weights (QLoRA)
+#
+# bitsandbytes and causal-conv1d are CUDA extensions. They usually FAIL to
+# build on Windows and generally work on Linux, which is a large part of why
+# real training happens on Kaggle rather than on the local GTX 1650.
+# Qwen3.5 also wants flash-linear-attention for its gated-delta-rule layers;
+# without it transformers falls back to a correct but much slower reference
+# implementation (it prints a warning, and training will crawl).

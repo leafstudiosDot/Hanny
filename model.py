@@ -11,7 +11,6 @@ Each run gets its own folder under checkpoints/ with best.pt, last.pt, sample.tx
 import argparse
 import math
 import os
-import sys
 import time
 from collections import Counter
 
@@ -21,16 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import data
+import utf8console
 
-# Windows consoles default to a legacy codepage (cp932 here) that cannot print the
-# U+FFFD "unknown" character, so printing a sample that contains one used to die
-# with UnicodeEncodeError *after* the run had already finished and saved. Force
-# UTF-8 output; errors="replace" means an unencodable character degrades to "?"
-# instead of taking the whole run down.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except (AttributeError, ValueError):
-    pass  # very old Python, or stdout was replaced by something with no reconfigure
+# A legacy Windows console codepage cannot print the U+FFFD "unknown" character,
+# and Python raises that error at flush time -- so the run finished, saved every
+# file, and still exited 1. See utf8console.py for the full explanation.
+utf8console.enable()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 parser = argparse.ArgumentParser()

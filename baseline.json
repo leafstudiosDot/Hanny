@@ -1,0 +1,15 @@
+{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "params": 752393024,
+  "dtype": "torch.float16",
+  "device": "cuda",
+  "windows": 64,
+  "seq_len": 512,
+  "chars_per_token": 2.893,
+  "val_chars": 2603687,
+  "val_tokens": 899874,
+  "loss": 1.324012,
+  "loss_se": 0.060823,
+  "perplexity": 3.7585,
+  "seconds": 148.9
+}
