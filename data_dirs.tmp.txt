@@ -1,9 +1,14 @@
 # Folders Hanny may learn source code from. One folder per line.
 # Lines starting with # are ignored. Subfolders are included automatically.
-# node_modules, .git, .venv, build output, minified files and files that look like they
-# contain secrets are skipped for you. Run `python data.py` to preview.
+#
+# A line starting with ! LEAVES OUT that folder (and everything inside it). Use it for code you
+# didn't write: copied libraries, cloned repos, SDKs. Otherwise the model mostly learns them.
+#
+# Already skipped for you: node_modules, .git, .venv, build output, emsdk, third_party, external,
+# deps, minified files, and files that look like they contain secrets.
+# Run `python data.py` to preview. It prints the biggest sources so you can spot what to exclude.
 #
 # Replace the examples below with your own folders:
 # C:\Users\YourName\projects\my-app
 # D:\old-projects
-# /home/yourname/projects/my-app
+# !D:\old-projects\some-cloned-library

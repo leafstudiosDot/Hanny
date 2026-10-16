@@ -1,37 +1,34 @@
 """
-Same idea as before (predict the next character), with two big changes:
-  1. Attention lets every character look at ALL earlier characters in its window (128, not 8).
-  2. Validation uses one whole held-out module (tarfile), so val loss is comparable between runs.
-This split differs from model.py, so treat this run as a NEW baseline, not a comparison to it.
+Setup:   list your code folders in data_dirs.txt (one per line; start a line with ! to leave a folder out).
+Check:   python data.py          (shows what will be used and skipped, no training)
+Train:   python model.py     (add --run my-name to name the run)
+The prepared data is cached in cache/, so later runs start fast. After adding code, it rebuilds by itself.
+
+Files that look like they contain API keys, tokens, private keys or hardcoded passwords are
+skipped entirely (see data.py). Whole files are held out for validation.
+Each run gets its own folder under checkpoints/ with best.pt, last.pt, sample.txt, data_report.txt.
 """
 import argparse
-import ast
-import dataclasses
-import difflib
-import inspect
-import json
 import math
 import os
-import re
-import shutil
-import socket
-import ssl
-import subprocess
-import tarfile
-import textwrap
-import threading
 import time
-import typing
+from collections import Counter
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import data
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 parser = argparse.ArgumentParser()
-parser.add_argument("--run-name", type=str, default="hanny",
-                    help="base name for this run's checkpoint file")
-parser.add_argument("--steps", type=int, default=3000)
+parser.add_argument("--dirs-file", type=str, default=os.path.join(HERE, "data_dirs.txt"))
+parser.add_argument("--run", type=str, default=time.strftime("own-code-%Y%m%d-%H%M"))
+parser.add_argument("--steps", type=int, default=4000)
 parser.add_argument("--eval-every", type=int, default=250)
+parser.add_argument("--max-chars", type=int, default=30_000_000, help="cap on training text size")
+parser.add_argument("--refresh-data", action="store_true", help="ignore the cached corpus and rebuild it")
 parser.add_argument("--prompt", type=str, default="def ")
 parser.add_argument("--temperature", type=float, default=0.8)
 args = parser.parse_args()
@@ -39,90 +36,85 @@ args = parser.parse_args()
 # Settings (change ONE at a time, then log what happened)
 BLOCK = 128      # how many previous characters the model can look at
 N_EMBD = 128     # size of each character's vector
-N_HEAD = 4       # attention heads (each one looks for a different kind of pattern)
-N_LAYER = 4      # how many attention + MLP blocks are stacked
+N_HEAD = 4       # attention heads
+N_LAYER = 4      # stacked attention + MLP blocks
 DROPOUT = 0.1    # randomly switches off units while training to reduce memorizing
 BATCH = 64
 LR = 1e-3
-
-# Checkpoints live in a checkpoints/ folder next to this script, not in the project root.
-# Every run writes its OWN file (hanny_m1_1_run001.pt, run002, ...) instead of overwriting a
-# shared name, so earlier runs stay loadable and can be compared later.
-CKPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
-os.makedirs(CKPT_DIR, exist_ok=True)
-
-
-def free_run_path(name):
-    """First unused checkpoints/<name>_runNNN.pt, so no run ever clobbers an older one."""
-    taken = set()
-    for filename in os.listdir(CKPT_DIR):
-        m = re.fullmatch(re.escape(name) + r"_run(\d+)\.pt", filename)
-        if m:
-            taken.add(int(m.group(1)))
-    n = 1
-    while n in taken:
-        n += 1
-    return os.path.join(CKPT_DIR, f"{name}_run{n:03d}.pt")
-
-
-CKPT_PATH = free_run_path(args.run_name)
+MIN_CHAR_COUNT = 50   # rarer characters (emoji, odd symbols) all become one "unknown" symbol
+UNK = "�"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(1337)
+np.random.seed(1337)
 print("device:", device)
-print("saving this run to:", CKPT_PATH)
 
-# 1. Data
-VAL_MODULE = tarfile  # never trained on: gives an honest score
-train_modules = [os, json, textwrap, argparse, inspect, ast, dataclasses, difflib,
-                 shutil, socket, ssl, subprocess, threading, typing]
+RUN_DIR = os.path.join(HERE, "checkpoints", args.run)
+os.makedirs(RUN_DIR, exist_ok=True)
 
+# 1. Data: your code, minus junk and secrets
+include, exclude = data.load_or_explain(args.dirs_file)
+train_text, val_text, report = data.get_corpus(
+    include, exclude, max_chars=args.max_chars,
+    cache_dir=os.path.join(HERE, "cache"), refresh=args.refresh_data)
+print(data.format_report(report))
+with open(os.path.join(RUN_DIR, "data_report.txt"), "w", encoding="utf-8") as f:
+    f.write(data.full_report_text(report) + "\n")
+if report["train_chars"] < 200_000 or report["val_chars"] < 10_000:
+    raise SystemExit("Too little code found. Add more folders to data_dirs.txt (or check the warnings above).")
 
-def read(m):
-    return open(m.__file__, encoding="utf-8").read()
-
-
-train_text = "\n".join(read(m) for m in train_modules)
-val_text = read(VAL_MODULE)
-chars = sorted(set(train_text + "\n" + val_text))
+counts = Counter(train_text)
+chars = sorted(c for c, n in counts.items() if n >= MIN_CHAR_COUNT)
+if UNK not in chars:
+    chars.append(UNK)
 stoi = {c: i for i, c in enumerate(chars)}
 itos = {i: c for c, i in stoi.items()}
-train_data = torch.tensor([stoi[c] for c in train_text], dtype=torch.long)
-val_data = torch.tensor([stoi[c] for c in val_text], dtype=torch.long)
-print(f"train: {len(train_data):,} chars | val: {len(val_data):,} chars | vocab: {len(chars)}")
+unk_id = stoi[UNK]
+
+
+# Fast vectorized encoder: look up every character's code point in a table
+lut = np.full(0x110000, unk_id, dtype=np.uint16)
+for c, i in stoi.items():
+    lut[ord(c)] = i
+
+
+def encode(s):
+    return lut[np.frombuffer(s.encode("utf-32-le"), dtype=np.uint32)]
+
+
+train_data, val_data = encode(train_text), encode(val_text)
+del train_text, val_text
+print(f"vocab: {len(chars)} characters | encoded train {len(train_data):,}, val {len(val_data):,}")
 
 
 def get_batch(which):
     d = train_data if which == "train" else val_data
-    ix = torch.randint(len(d) - BLOCK - 1, (BATCH,))
-    x = torch.stack([d[i:i + BLOCK] for i in ix])
-    y = torch.stack([d[i + 1:i + BLOCK + 1] for i in ix])  # the same window shifted by one
-    return x.to(device), y.to(device)
+    ix = np.random.randint(0, len(d) - BLOCK - 1, size=BATCH)
+    x = np.stack([d[i:i + BLOCK] for i in ix]).astype(np.int64)
+    y = np.stack([d[i + 1:i + BLOCK + 1] for i in ix]).astype(np.int64)   # the same window shifted by one
+    return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
 
 
-# 2. Model
+# 2. Model (identical to the first version)
 class CausalSelfAttention(nn.Module):
-    """Each position asks: which earlier characters matter for predicting what comes next?"""
-
     def __init__(self):
         super().__init__()
-        self.qkv = nn.Linear(N_EMBD, 3 * N_EMBD)   # query, key, value for all heads at once
+        self.qkv = nn.Linear(N_EMBD, 3 * N_EMBD)
         self.proj = nn.Linear(N_EMBD, N_EMBD)
         self.drop = nn.Dropout(DROPOUT)
-        # lower-triangle mask: a character may look backwards, never at the future
         self.register_buffer("mask", torch.tril(torch.ones(BLOCK, BLOCK)).view(1, 1, BLOCK, BLOCK))
 
     def forward(self, x):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         hs = C // N_HEAD
-        q = q.view(B, T, N_HEAD, hs).transpose(1, 2)   # (B, heads, T, head_size)
+        q = q.view(B, T, N_HEAD, hs).transpose(1, 2)
         k = k.view(B, T, N_HEAD, hs).transpose(1, 2)
         v = v.view(B, T, N_HEAD, hs).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(hs)          # how well each query matches each key
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(hs)
         att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = self.drop(F.softmax(att, dim=-1))                   # turn match scores into weights
-        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)  # weighted mix of the values
+        att = self.drop(F.softmax(att, dim=-1))
+        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
         return self.drop(self.proj(y))
 
 
@@ -138,7 +130,7 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))   # residual connection: add, don't replace
+        x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -146,8 +138,8 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, vocab):
         super().__init__()
-        self.tok_emb = nn.Embedding(vocab, N_EMBD)   # what character is this?
-        self.pos_emb = nn.Embedding(BLOCK, N_EMBD)   # where in the window is it?
+        self.tok_emb = nn.Embedding(vocab, N_EMBD)
+        self.pos_emb = nn.Embedding(BLOCK, N_EMBD)
         self.blocks = nn.Sequential(*[Block() for _ in range(N_LAYER)])
         self.ln_f = nn.LayerNorm(N_EMBD)
         self.head = nn.Linear(N_EMBD, vocab)
@@ -155,7 +147,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
         x = self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
-        logits = self.head(self.ln_f(self.blocks(x)))   # (B, T, vocab): a prediction at EVERY position
+        logits = self.head(self.ln_f(self.blocks(x)))
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -164,7 +156,7 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, n_new, temperature):
         for _ in range(n_new):
-            logits, _ = self(idx[:, -BLOCK:])                      # only the last BLOCK characters fit
+            logits, _ = self(idx[:, -BLOCK:])
             probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
             idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
         return idx
@@ -174,6 +166,13 @@ model = GPT(len(chars)).to(device)
 opt = torch.optim.AdamW(model.parameters(), lr=LR)
 print(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
 print(f"loss of pure guessing would be about {math.log(len(chars)):.2f}")
+config = {"BLOCK": BLOCK, "N_EMBD": N_EMBD, "N_HEAD": N_HEAD, "N_LAYER": N_LAYER,
+          "DROPOUT": DROPOUT, "BATCH": BATCH, "LR": LR, "steps": args.steps}
+
+
+def save(name):
+    torch.save({"model": model.state_dict(), "chars": chars, "config": config},
+               os.path.join(RUN_DIR, name))
 
 
 @torch.no_grad()
@@ -199,12 +198,7 @@ for step in range(args.steps + 1):
         marker = ""
         if losses["val"] < best_val:
             best_val = losses["val"]
-            # Stored alongside the weights so an old run file explains itself later
-            torch.save({"model": model.state_dict(), "chars": chars, "step": step,
-                        "val_loss": best_val,
-                        "config": {"run_name": args.run_name, "steps": args.steps, "block": BLOCK,
-                                   "n_embd": N_EMBD, "n_head": N_HEAD, "n_layer": N_LAYER,
-                                   "dropout": DROPOUT, "batch": BATCH, "lr": LR}}, CKPT_PATH)
+            save("best.pt")
             marker = "  <- best so far, saved"
         print(f"step {step:5d} | train {losses['train']:.3f} | val {losses['val']:.3f} "
               f"| {time.time() - t0:5.0f}s{marker}")
@@ -214,14 +208,16 @@ for step in range(args.steps + 1):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
+save("last.pt")
 
-# 4. Generate from the BEST checkpoint of THIS run (not necessarily the last step)
-ckpt = torch.load(CKPT_PATH, map_location=device)
-model.load_state_dict(ckpt["model"])
+# 4. Generate from the BEST checkpoint
+model.load_state_dict(torch.load(os.path.join(RUN_DIR, "best.pt"), map_location=device)["model"])
 model.eval()
-start = torch.tensor([[stoi[c] for c in args.prompt]], dtype=torch.long, device=device)
+start = torch.tensor([[stoi.get(c, unk_id) for c in args.prompt]], dtype=torch.long, device=device)
 out = model.generate(start, 600, args.temperature)[0].tolist()
-print(f"\nbest val loss: {best_val:.3f}")
-print("checkpoint:", CKPT_PATH)
+sample = "".join(itos[i] for i in out)
+with open(os.path.join(RUN_DIR, "sample.txt"), "w", encoding="utf-8") as f:
+    f.write(sample + "\n")
+print(f"\nbest val loss: {best_val:.3f}   (files saved in {RUN_DIR})")
 print("\n- output -")
-print("".join(itos[i] for i in out))
+print(sample)
