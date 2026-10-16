@@ -241,9 +241,12 @@ These are the things that will waste an afternoon if you don't know them.
    and is very slow, with no warning beyond a `device: cpu` line in the output.
    Run `gpu_check.py` first.
 
-2. **Val loss is noisy.** `estimate_loss()` samples 30 random windows each time
-   rather than using a fixed eval set, so val loss bounces between runs. Only
-   compare runs with identical settings.
+2. **Val loss is now a fixed number.** Evaluation scores the same 256 windows,
+   spread evenly across the split, on every run — so two runs are directly
+   comparable and a change smaller than the `±` printed next to it is noise.
+   Each eval row is also appended to `curve.csv` in the run folder. (Before
+   this, `estimate_loss()` drew 30 fresh random windows every call, so the same
+   model scored differently each time.)
 
 3. **Old checkpoints don't load after an architecture change.** `BLOCK`,
    `N_EMBD`, `N_HEAD`, and `N_LAYER` are module-level constants, so changing

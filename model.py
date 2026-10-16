@@ -11,6 +11,7 @@ Each run gets its own folder under checkpoints/ with best.pt, last.pt, sample.tx
 import argparse
 import math
 import os
+import sys
 import time
 from collections import Counter
 
@@ -20,6 +21,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import data
+
+# Windows consoles default to a legacy codepage (cp932 here) that cannot print the
+# U+FFFD "unknown" character, so printing a sample that contains one used to die
+# with UnicodeEncodeError *after* the run had already finished and saved. Force
+# UTF-8 output; errors="replace" means an unencodable character degrades to "?"
+# instead of taking the whole run down.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass  # very old Python, or stdout was replaced by something with no reconfigure
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 parser = argparse.ArgumentParser()
@@ -175,33 +186,65 @@ def save(name):
                os.path.join(RUN_DIR, name))
 
 
+# 2b. A FIXED evaluation set
+# estimate_loss() used to draw 30 brand-new random windows every time it ran, so
+# the same model scored differently on every call and no two runs were comparable.
+# Now the window starting points are chosen ONCE, spread evenly across the whole
+# split, and every run is scored on exactly those windows.
+EVAL_WINDOWS = 256   # 4 batches of BATCH=64, so an eval costs ~4 forward passes
+
+
+def eval_windows(d):
+    """Evenly spaced start indices -> the same window boundaries on every run."""
+    n = min(EVAL_WINDOWS, len(d) - BLOCK - 1)
+    starts = np.linspace(0, len(d) - BLOCK - 1, n).astype(np.int64)
+    x = np.stack([d[i:i + BLOCK] for i in starts]).astype(np.int64)
+    y = np.stack([d[i + 1:i + BLOCK + 1] for i in starts]).astype(np.int64)
+    return torch.from_numpy(x), torch.from_numpy(y)
+
+
+TRAIN_EVAL_X, TRAIN_EVAL_Y = eval_windows(train_data)
+VAL_EVAL_X, VAL_EVAL_Y = eval_windows(val_data)
+
+
 @torch.no_grad()
-def estimate_loss():
+def fixed_loss(x, y):
+    """Mean loss over the fixed windows, plus the standard error of that mean."""
     model.eval()
-    out = {}
-    for which in ("train", "val"):
-        total = 0.0
-        for _ in range(30):
-            x, y = get_batch(which)
-            total += model(x, y)[1].item()
-        out[which] = total / 30
+    per_window = []
+    for i in range(0, len(x), BATCH):
+        xb, yb = x[i:i + BATCH].to(device), y[i:i + BATCH].to(device)
+        m = model(xb, yb)[1].item()
+        # every window in a batch holds exactly BLOCK tokens, so the batch mean IS
+        # the mean of its window means -- replicating it is exact, not a fudge
+        per_window.extend([m] * len(xb))
     model.train()
-    return out
+    a = np.asarray(per_window, dtype=np.float64)
+    return float(a.mean()), float(a.std(ddof=1) / np.sqrt(len(a)))
 
 
 # 3. Training loop
+CURVE = os.path.join(RUN_DIR, "curve.csv")
+if not os.path.exists(CURVE):
+    with open(CURVE, "w", encoding="utf-8") as f:
+        f.write("step,train,train_se,val,val_se,seconds\n")
+
 best_val = float("inf")
 t0 = time.time()
 for step in range(args.steps + 1):
     if step % args.eval_every == 0:
-        losses = estimate_loss()
+        tr, tr_se = fixed_loss(TRAIN_EVAL_X, TRAIN_EVAL_Y)
+        va, va_se = fixed_loss(VAL_EVAL_X, VAL_EVAL_Y)
+        losses = {"train": tr, "val": va}
         marker = ""
-        if losses["val"] < best_val:
-            best_val = losses["val"]
+        if va < best_val:
+            best_val = va
             save("best.pt")
             marker = "  <- best so far, saved"
-        print(f"step {step:5d} | train {losses['train']:.3f} | val {losses['val']:.3f} "
+        print(f"step {step:5d} | train {tr:.3f}+-{tr_se:.3f} | val {va:.3f}+-{va_se:.3f} "
               f"| {time.time() - t0:5.0f}s{marker}")
+        with open(CURVE, "a", encoding="utf-8") as f:
+            f.write(f"{step},{tr:.4f},{tr_se:.4f},{va:.4f},{va_se:.4f},{time.time() - t0:.1f}\n")
     x, y = get_batch("train")
     _, loss = model(x, y)
     opt.zero_grad(set_to_none=True)
