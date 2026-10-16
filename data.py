@@ -121,6 +121,114 @@ def load_dirs(path):
     return include, exclude
 
 
+def _strip_cache_suffix(name):
+    """The fingerprint embedded in a corpus cache filename, or None.
+
+    Accepts both corpus-<fp>.json.gz and the uncompressed corpus-<fp>.json, in
+    that order: a .json.gz name also ends with .json, so the longer suffix has
+    to be tried first or every gzipped cache would parse as fingerprint 'x.gz'.
+    """
+    if not name.startswith("corpus-"):
+        return None
+    for suffix in (".json.gz", ".json"):
+        if name.endswith(suffix) and len(name) > len("corpus-") + len(suffix):
+            return name[len("corpus-"):-len(suffix)]
+    return None
+
+
+def find_cached(cache_dir):
+    """Newest corpus cache file in cache_dir, or None if there is none.
+
+    Kaggle and Colab cannot see the local folders listed in data_dirs.txt, so
+    get_corpus() would compute a different cache key (nothing to walk) and miss.
+    The prepared corpus is uploaded instead and loaded with load_cached().
+
+    os.path.isfile() is not optional. Kaggle's dataset pipeline can hand back a
+    *directory* named corpus-<fp>.json in place of the cache file, and a plain
+    name check would then select it and fail later with IsADirectoryError.
+    """
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return None
+    names = [n for n in os.listdir(cache_dir)
+             if _strip_cache_suffix(n) is not None
+             and os.path.isfile(os.path.join(cache_dir, n))]
+    if not names:
+        return None
+    names.sort(key=lambda n: os.path.getmtime(os.path.join(cache_dir, n)))
+    return os.path.join(cache_dir, names[-1])
+
+
+def fingerprint_of(path):
+    """The cache key embedded in corpus-<fingerprint>.json[.gz].
+
+    data.py derives it from DATA_VERSION, max_chars, seed, the extension and
+    skip lists, the excludes, and a sha1 of every candidate file's path, size
+    and mtime. It changes if ANY of that changes, so a result recorded next to
+    it is tied to one exact corpus. Not portable across machines, because mtime
+    is not -- which is why the corpus is uploaded, never rebuilt, in the cloud.
+    """
+    return _strip_cache_suffix(os.path.basename(path or ""))
+
+
+def export_plain(cache_dir, out_dir):
+    """Write an uncompressed copy of the newest cache, for uploading.
+
+    A .gz *inside* a zip *inside* a Kaggle Dataset is a triple compression
+    stack, and Kaggle's dataset pipeline mangles it: cache/corpus-<fp>.json.gz
+    came back as a directory corpus-<fp>.json containing a .gz.tmp file, so
+    find_cached() matched nothing and finetune.py died on a None path. Uploading
+    plain JSON sidesteps the pipeline entirely. 0.8 MB becomes ~3.1 MB, which is
+    nothing against Kaggle's 20 GB working directory.
+
+    Returns the path written, or None if there is no cache to export.
+    """
+    src = find_cached(cache_dir)
+    if src is None:
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+    opener = gzip.open if src.endswith(".gz") else open
+    with opener(src, "rt", encoding="utf-8") as f:
+        blob = json.load(f)
+    stem = os.path.basename(src)
+    for suffix in (".json.gz", ".json"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+            break
+    dst = os.path.join(out_dir, stem + ".json")
+    with open(dst, "w", encoding="utf-8") as f:
+        json.dump(blob, f, ensure_ascii=False)
+    return dst
+
+
+def load_cached(path):
+    """Load a prepared corpus from its cache file, without walking any folder.
+
+    Returns (train_text, val_text, report, fingerprint).
+    """
+    if not path:
+        raise FileNotFoundError(
+            "no corpus cache directory found. Upload the cache folder into "
+            "/kaggle/working with 'cp -r' (a plain cp skips a directory "
+            "silently) -- see README 'Training on Kaggle'")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"no corpus cache at {path!r}; build one locally first "
+                                r"(python data.py) and upload cache\corpus-*.json.gz")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path!r} is a directory, not a corpus file. Kaggle's dataset "
+            r"pipeline can replace an uploaded .gz with a directory of the "
+            r"same name -- upload the plain corpus-<fp>.json instead, via "
+            r"'python data.py --export-plain'")
+    # Kaggle serves the corpus uncompressed, locally it stays gzipped.
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        blob = json.load(f)
+    for key in ("train", "val", "report"):
+        if key not in blob:
+            raise ValueError(f"{path} is not a corpus cache (missing {key!r})")
+    return blob["train"], blob["val"], _report_from_json(blob["report"]), fingerprint_of(path)
+
+
 def load_or_explain(dirs_file):
     if not os.path.exists(dirs_file):
         sys.exit(f"Missing {dirs_file}. Create it with one folder per line, for example:\n"
@@ -333,11 +441,27 @@ def full_report_text(report):
 
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(here, "cache")
     ap = argparse.ArgumentParser()
     ap.add_argument("--dirs-file", default=os.path.join(here, "data_dirs.txt"))
     ap.add_argument("--max-chars", type=int, default=30_000_000)
     ap.add_argument("--refresh-data", action="store_true")
+    ap.add_argument("--export-plain", metavar="DIR", nargs="?", const="upload",
+                    help="also write the cache as uncompressed DIR/corpus-<fp>.json. "
+                         "Kaggle's dataset pipeline mangles a .gz nested inside an "
+                         "uploaded zip, so the Kaggle archive ships the plain form.")
     a = ap.parse_args()
+
+    if a.export_plain is not None:
+        # Build the corpus first if it is not there yet, so one command is enough.
+        if find_cached(cache_dir) is None:
+            include, exclude = load_or_explain(a.dirs_file)
+            get_corpus(include, exclude, a.max_chars, cache_dir=cache_dir, refresh=a.refresh_data)
+        out_dir = a.export_plain if os.path.isabs(a.export_plain) else os.path.join(here, a.export_plain)
+        written = export_plain(cache_dir, out_dir)
+        print(f"exported {written} ({os.path.getsize(written):,} bytes)" if written
+              else "no corpus cache to export")
+
     include, exclude = load_or_explain(a.dirs_file)
-    _, _, rep = get_corpus(include, exclude, a.max_chars, cache_dir=os.path.join(here, "cache"), refresh=a.refresh_data)
+    _, _, rep = get_corpus(include, exclude, a.max_chars, cache_dir=cache_dir, refresh=a.refresh_data)
     print(format_report(rep))

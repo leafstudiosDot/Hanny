@@ -23,3 +23,9 @@
 # gitignore does not affect tracked files, so the template stays published.
 /data_dirs*.txt
 /cache/
+
+# Kaggle upload archive. Contains the private corpus -- the source text plus the
+# report block with real folder and secret-file paths -- and .gitattributes
+# routes archives to LFS, so an accidental `git add .` would push all of it.
+/hanny-kaggle.zip
+/upload/

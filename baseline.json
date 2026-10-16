@@ -6,10 +6,13 @@
   "windows": 64,
   "seq_len": 512,
   "chars_per_token": 3.622,
+  "window_overlap": 0.0,
+  "eval_coverage": 0.55,
+  "corpus_fingerprint": "c7189ca503eb68f1",
   "val_chars": 215664,
   "val_tokens": 59549,
   "loss": 1.50978,
   "loss_se": 0.088913,
   "perplexity": 4.5257,
-  "seconds": 146.4
+  "seconds": 142.8
 }

@@ -153,9 +153,212 @@ Change **one** hyperparameter at a time and log what happened. With a noise
 floor of about `±0.01`, a change smaller than `~0.03` is not evidence of
 anything.
 
+### Step 5 — fine-tune on Kaggle (about 80 minutes)
+
+M4 does not fit the 4GB card for a real run. See
+[Training on Kaggle](#training-on-kaggle). A 20-step smoke test works locally
+first:
+
+```bash
+.venv\Scripts\python.exe finetune.py --run m4-smoke --max-steps 20 --batch 1 --eval-every 10
+```
+
+It should print a `provenance check passed` line, a loss falling from `~1.60`,
+and write `checkpoints/m4-smoke/result.json`.
+
 ---
 
 ## Options
+
+### `finetune.py` — LoRA fine-tune (M4)
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--model` | `Qwen/Qwen3.5-0.8B` | Base model to adapt |
+| `--run` | timestamp | Output folder under `checkpoints/` |
+| `--corpus-cache` | `cache/` | Folder holding `corpus-*.json.gz` |
+| `--rebuild-corpus` | off | Walk `data_dirs.txt` instead of loading the cache |
+| `--seq-len` | `512` | Tokens per window — **must match `baseline.py`** |
+| `--batch` | `8` | Windows per training step |
+| `--eval-windows` | `64` | **Must match `baseline.py`** or the run is rejected |
+| `--eval-batch` | `1` | Raise to `8` on a 16GB GPU; eval dominates wall clock |
+| `--epochs` | `3` | Passes over the training corpus |
+| `--max-steps` | `0` | Stop early; `0` runs all epochs |
+| `--eval-every` | `100` | Steps between validation passes |
+| `--lr` | `2e-4` | LoRA learning rate |
+| `--lora-r` / `--lora-alpha` | `16` / `32` | LoRA rank and scaling |
+| `--seed` | `1337` | Fixed, so runs are reproducible |
+
+---
+
+## Training on Kaggle
+
+M4 runs on Kaggle. Not Colab — Kaggle gives two T4s and a dataset store you can
+attach directly, and you need somewhere to put the corpus.
+
+### What to upload
+
+The corpus, prepared locally. It is **0.80 MB** and lives in
+`cache/corpus-<fingerprint>.json.gz`.
+
+```powershell
+.venv\Scripts\python.exe data.py --export-plain upload
+tar -a -cf hanny-kaggle.zip upload\corpus-*.json finetune.py data.py evalkit.py utf8console.py baseline.json model.py requirements.txt
+```
+
+> **Why the corpus is uploaded uncompressed.** A `.json.gz` nested inside the
+> zip is a triple compression stack, and Kaggle's dataset pipeline mangles it:
+> `cache/corpus-<fp>.json.gz` came back as a *directory* called
+> `corpus-<fp>.json` holding a `.json.gz.tmp` file, so `find_cached()` matched
+> nothing and `finetune.py` died on a `None` path. Plain JSON skips that
+> pipeline entirely — 0.8 MB becomes 3.1 MB, against 20 GB of working dir.
+> Locally the cache stays gzipped; `data.py` reads both forms.
+
+> **Keep the dataset private.** The cache contains your source code *and* 77
+> folder paths plus 15 secret-file paths in its `report` block. It is not
+> indexed while private. Do not make it public without stripping `report`.
+
+Upload `hanny-kaggle.zip` as a **private Kaggle Dataset**. Name it after the
+fingerprint, e.g. `hanny-corpus-c7189ca5`, so the name says which corpus a run
+used — that hash changes automatically whenever the corpus does.
+
+### Notebook cells
+
+```python
+# Cell 1 - dependencies
+# Re-run this in EVERY new session. Kaggle ships its own torch, and the pip
+# installs below do not persist across a session restart -- skip this cell and
+# Cell 3 dies on a bare ImportError.
+#
+# Do NOT use `-r requirements.txt` here: it pins torch==2.11.0+cu128 from the
+# cu128 index, which would replace Kaggle's CUDA-matched torch. Install the M4
+# subset instead, pinned to what requirements.txt already verified.
+!pip install -q "transformers==5.20.0" "accelerate==1.15.0" "huggingface-hub==2.2.0" "peft==0.21.2" "trl==1.16.0" "bitsandbytes==0.50.2"
+# Optional, big speedup. Qwen3.5's gated-delta-rule layers fall back to a slow
+# reference implementation without it (~7.6s/step on a GTX 1650).
+!pip install -q flash-linear-attention
+
+# Verify, because a silent -q install failure resurfaces 2 minutes into Cell 3.
+from importlib.metadata import version
+def _v(pkg): return tuple(int(x) for x in version(pkg).split(".")[:2])
+print({p: version(p) for p in ("bitsandbytes", "transformers", "peft", "trl", "accelerate")})
+assert _v("bitsandbytes") >= (0, 46), "bitsandbytes < 0.46.1: 4-bit will not load"
+```
+
+```python
+# Cell 2 - unpack and check the GPU
+# Kaggle auto-extracts dataset archives, so hanny-kaggle.zip is already expanded
+# under /kaggle/input. The -r matters: upload/ is a directory, and a plain `cp`
+# skips it with a warning while still exiting 0 -- the corpus then goes missing.
+!cp -r /kaggle/input/datasets/<your-user>/hanny-corpus-c7189ca5/* /kaggle/working
+import os, torch
+# All three must pass before Cell 3. A missing script or corpus in
+# /kaggle/working otherwise reads like a bad command rather than a bad copy.
+print(sorted(os.listdir("/kaggle/working")))        # 'finetune.py' must be listed
+print(sorted(os.listdir("/kaggle/working/upload")))  # ['corpus-<fp>.json']
+print(os.path.getsize("/kaggle/working/upload/corpus-c7189ca503eb68f1.json"))
+print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
+print(torch.cuda.get_device_capability(0))   # (7, 5) = T4 = Turing = no bf16
+```
+
+```python
+# Cell 3 - train
+# --corpus-cache upload: the archive ships the corpus uncompressed under upload/,
+# not the local cache/ path that the flag defaults to.
+!cd /kaggle/working && python finetune.py --run m4 --epochs 3 --batch 8 --eval-batch 8 --corpus-cache upload
+```
+
+```python
+# Cell 4 - results
+import json
+r = json.load(open("/kaggle/working/checkpoints/m4/result.json"))
+print(json.dumps(r, indent=2))
+```
+
+### Six things that will bite you
+
+**Cell 1 does not survive a session restart.** Kaggle's pip installs are
+per-session. Start a fresh session for a new Dataset — as you must when the
+archive changes — and Cell 3 dies on `ImportError: ... requires
+bitsandbytes>=0.46.1` until you re-run Cell 1. That is not a broken script; it
+is a missing step, and it looks identical to a dependency conflict.
+
+**Never `pip install -r requirements.txt` on Kaggle.** It pins
+`torch==2.11.0+cu128` from the cu128 index and would overwrite the
+CUDA-matched torch Kaggle already ships. Cell 1 installs the M4 subset instead.
+
+**GPU 2 sits at 0% and that is expected.** This is a single-process run; nothing
+here uses DDP or device maps, so the second T4 is idle. Two GPUs would roughly
+halve the wall clock, but that is a different recipe, not a switch.
+
+**Expect ~80 minutes, not 20.** 555 steps at 4096 tokens each on one T4. If you
+see ~7-9 s/step, check the `flash-linear-attention` line Cell 1 prints: without
+it the gated-delta-rule layers run a reference implementation and the run takes
+several times longer.
+
+**Kaggle mangles a `.gz` nested inside your dataset archive.** It returned a
+*directory* named `corpus-<fp>.json` where the cache file should be, so
+`find_cached()` matched nothing and `finetune.py` died on `None`. Upload the
+corpus as plain JSON (`--export-plain`) and it never enters that code path.
+Worse, because the mangled entry shares the plain file's name, you cannot
+create the correct file alongside it — you need a **new Dataset**, not a
+new version of the old one.
+
+**`cp` without `-r` skips `upload/` and still exits 0.** It prints
+`cp: -r not specified; omitting directory` and carries on, so the corpus is
+silently absent and Cell 3 dies with `no corpus cache at None`. Use `cp -r`.
+
+**Kaggle snapshots the input dataset at session start.** After you rebuild
+`hanny-kaggle.zip`, an already-open notebook keeps reading the *old* version.
+Publish the fix as a new Dataset version and start a fresh session, or Cell 2
+will keep unpacking the broken archive.
+
+**T4 is Turing, compute capability 7.5 — it has no bf16.** That is the same
+generation as your GTX 1650. Any recipe that hardcodes `bf16=True` fails or
+silently downcasts. `finetune.py` detects this and prints a note.
+
+**Save the adapter or lose it.** Kaggle resets idle sessions. After Cell 3,
+add the output as a new Kaggle Dataset (or commit it to your LAN Gitea, which
+is only ~25 MB). The adapter is the entire fine-tune — you do not need to save
+the 1.5 GB base model.
+
+---
+
+## Publishing to Hugging Face
+
+For M8. Three separate things can be published, and only the third is safe with
+your current corpus.
+
+**1. The adapter (recommended first).** ~25 MB, Apache-2.0 base, LoRA weights.
+Private to start — it was trained on your private code.
+
+```python
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo("yourname/hanny-adapter-m4", repo_type="model", private=True)
+api.upload_folder("checkpoints/m4/adapter-best",
+                  "yourname/hanny-adapter-m4", repo_type="model")
+```
+
+**2. A merged full model.** ~1.5 GB. Merge the adapter into the base weights
+and upload that if you want a single file anyone can load without `peft`.
+
+**3. The training corpus — do not, yet.** `data.py` is built to train on your
+own private source code. You can only grant rights to data you hold rights to,
+so publishing the corpus means either stripping it to code you wrote entirely
+from scratch, or replacing it with a public dataset such as
+`bigcode/the-stack`. This is a provenance decision, not a technical one.
+
+A model card needs at minimum: base model and licence, your LoRA config, the
+corpus fingerprint, the before/after loss, and an explicit statement about what
+the training data was. `finetune.py` writes most of that into
+`result.json` for you.
+
+Note that Kaggle Models now largely mirrors Hugging Face — pushing to the Hub
+is the primary move, and Kaggle will surface the model automatically if a
+notebook uses it.
+
+---
 
 ### `model.py` — character-level Hanny
 
@@ -371,12 +574,21 @@ The things that will waste an afternoon if you don't know them.
    entry point imports `utf8console.py` to prevent this. If you add a script,
    do the same.
 
-8. **Don't import `model.py`.** It calls `argparse.parse_args()` at module
-   level, so importing rather than running it parses your `sys.argv`.
+8. **Don't import the scripts.** `model.py`, `baseline.py` and `finetune.py`
+   all call `argparse.parse_args()` at module level *and then run the whole
+   pipeline*, so importing one rather than executing it parses your `sys.argv`
+   and starts training. `data.py` and `evalkit.py` are the only safe imports.
 
 9. **There is no test suite.** Verification is running the scripts. `baseline.py`
    run twice must produce identical numbers; `model.py --steps 40` run twice
-   must produce an identical `curve.csv`.
+   must produce an identical `curve.csv`; `finetune.py` must print
+   `provenance check passed` before you believe any number it produces.
+
+10. **4-bit quantisation costs accuracy.** The same model scores 1.5098 in fp16
+    and 1.5955 as 4-bit NF4 — about 0.086 nats. `finetune.py` prints its own
+    `BEFORE` number from the 4-bit base; compare `AFTER` against **that**, not
+    against `baseline.json`. Comparing across precisions would credit the
+    fine-tune with a loss that came from quantisation.
 
 ---
 
@@ -385,11 +597,13 @@ The things that will waste an afternoon if you don't know them.
 | File | Purpose |
 | --- | --- |
 | `model.py` | Character-level training / eval / generate, one script |
+| `finetune.py` | M4 LoRA fine-tune of `Qwen3.5-0.8B` with a provenance check |
 | `data.py` | Corpus collector with secret-scanning and caching |
+| `evalkit.py` | The one fixed-evaluation implementation, shared by all scripts |
 | `baseline.py` | Scores a pretrained model on the same held-out code |
 | `utf8console.py` | Makes non-ASCII printing safe on Windows consoles |
 | `gpu_check.py` | CUDA availability check and CPU-vs-GPU benchmark |
-| `baseline.json` | The M3 baseline M4 must beat |
+| `baseline.json` | The M3 baseline, with corpus fingerprint |
 | `LOG.md` | Build log, one section per milestone |
 | `data_dirs.tmp.txt` | Template for `data_dirs.txt` |
 | `AGENTS.md` | Notes for coding agents working in this repo |

@@ -33,6 +33,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import data
+import evalkit
 import utf8console
 
 utf8console.enable()
@@ -60,18 +61,21 @@ print(f"device: {device} | dtype: {dtype}")
 
 # 1. The same held-out split Hanny uses. From cache, so this is instant.
 include, exclude = data.load_or_explain(os.path.join(HERE, "data_dirs.txt"))
+cache_dir = os.path.join(HERE, "cache")
 _, val_text, report = data.get_corpus(
     include, exclude, max_chars=30_000_000,
-    cache_dir=os.path.join(HERE, "cache"), refresh=args.refresh_data)
+    cache_dir=cache_dir, refresh=args.refresh_data)
+fingerprint = data.fingerprint_of(data.find_cached(cache_dir))
 print(f"held-out validation text: {len(val_text):,} chars "
       f"({report.get('val_files', '?')} files, never trained on)")
+print(f"corpus fingerprint: {fingerprint or '(none)'}")
 
 # 2. Tokenize. This is the whole point of moving off characters: the model now
 #    reads ~3 characters per token, so a fixed context window covers ~3x more code.
 tok = AutoTokenizer.from_pretrained(args.model)
-# The tokenizer warns because we hand it 900k tokens at once, while the model's
-# advertised limit is 262144. We slice into windows of --seq-len immediately
-# below and never feed more than that, so the check is noise here.
+# The tokenizer warns because we hand it the whole split at once, while the
+# model's advertised limit is 262144. We slice into windows of --seq-len
+# immediately below and never feed more than that, so the check is noise here.
 tok.model_max_length = int(1e12)
 t0 = time.time()
 ids = tok(val_text, add_special_tokens=False)["input_ids"]
@@ -80,49 +84,29 @@ chars_per_token = len(val_text) / len(ids)
 print(f"tokenized to {len(ids):,} tokens in {time.time()-t0:.1f}s "
       f"({chars_per_token:.2f} chars per token)")
 
-# 3. Fixed, evenly spaced windows -- identical method to M2's eval set.
-if len(ids) < args.seq_len + 1:
-    raise SystemExit(f"validation text too small: {len(ids)} tokens for "
-                     f"seq-len {args.seq_len}")
-if args.windows < 2:
-    raise SystemExit("--windows must be at least 2 (one window has no spread)")
-starts = np.linspace(0, len(ids) - args.seq_len - 1, args.windows).astype(np.int64)
-windows = np.stack([ids[s:s + args.seq_len] for s in starts])
-print(f"{args.windows} fixed windows of {args.seq_len} tokens "
+# 3. Fixed, evenly spaced windows -- built by evalkit so every script agrees.
+windows = evalkit.fixed_windows(ids, args.windows, args.seq_len)
+cov, ov, spacing = evalkit.window_geometry(len(ids), args.windows, args.seq_len)
+print(f"{len(windows)} fixed windows of {args.seq_len} tokens "
       f"(~{args.seq_len * chars_per_token:.0f} chars of code each)")
+print(f"window spacing {spacing:.0f} tokens, overlap {ov*100:.0f}%, "
+      f"covering {cov*100:.0f}% of the split")
 
 # 4. Load the untouched model and score it.
 model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(device).eval()
 n_params = sum(p.numel() for p in model.parameters())
 print(f"{args.model}: {n_params/1e6:.0f}M parameters, nothing fine-tuned yet")
 
-x_all = torch.from_numpy(windows)
-
-per_window = []
 t0 = time.time()
-with torch.no_grad():
-    for i in range(0, len(x_all), args.batch):
-        xb = x_all[i:i + args.batch].to(device)
-        loss = model(xb, labels=xb).loss.item()
-        # every row has the same token count, so the batch mean IS the mean of
-        # its window means -- same trick M2 used, and exact for the same reason
-        per_window.extend([loss] * len(xb))
+mean, se = evalkit.score(model, windows, args.batch, device)
 elapsed = time.time() - t0
-
-a = np.asarray(per_window, dtype=np.float64)
-mean = float(a.mean())
-# A standard error needs at least two samples; numpy's ddof=1 returns NaN for n=1,
-# which would silently poison baseline.json with a null noise floor.
-if len(a) < 2:
-    raise SystemExit(f"--windows {len(a)} cannot produce a standard error; use 2 or more")
-se = float(a.std(ddof=1) / np.sqrt(len(a)))
 
 print("\n" + "=" * 68)
 print(f"BASELINE  {args.model}  (no fine-tuning at all)")
 print(f"  loss         {mean:.4f} +- {se:.4f}")
 print(f"  perplexity   {math.exp(mean):.3f}")
 print(f"  vs M2 scale  a random guess over this vocab would be ~{math.log(len(tok)):.2f}")
-print(f"  scored       {args.windows} windows x {args.seq_len} tokens "
+print(f"  scored       {len(windows)} windows x {args.seq_len} tokens "
       f"in {elapsed:.1f}s")
 print("=" * 68)
 print("\nPerplexity is the average number of choices the model weighs at each\n"
@@ -135,9 +119,12 @@ result = {
     "params": int(n_params),
     "dtype": str(dtype),
     "device": device,
-    "windows": args.windows,
+    "windows": len(windows),
     "seq_len": args.seq_len,
     "chars_per_token": round(chars_per_token, 3),
+    "window_overlap": round(ov, 3),
+    "eval_coverage": round(cov, 3),
+    "corpus_fingerprint": fingerprint,
     "val_chars": len(val_text),
     "val_tokens": int(len(ids)),
     "loss": round(mean, 6),

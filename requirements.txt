@@ -4,7 +4,7 @@ tensorboard
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.11.0+cu128
 
-# --- M3: token-level fine-tuning line (baseline.py) ---
+# --- M3: token-level line (baseline.py) ---
 # transformers 5.x renamed the dtype kwarg on from_pretrained: it is `dtype=`
 # now, and `torch_dtype=` is gone. Pinned so that rename cannot silently
 # change behaviour between machines.
@@ -14,14 +14,21 @@ huggingface-hub==2.2.0
 tokenizers==0.23.3
 safetensors==0.8.0
 
-# --- M4 (not installed yet, listed so the plan is explicit) ---
-# peft        -- LoRA adapters, the fine-tuning method M4 uses
-# trl         -- SFTTrainer, so we do not hand-write a training loop
-# bitsandbytes -- 4-bit quantised base weights (QLoRA)
+# --- M4: LoRA fine-tuning (finetune.py) ---
+# peft/trl/bitsandbytes now verified working on Windows, which surprised us:
+# bitsandbytes ships cp313 wheels. The earlier note that it "usually FAILS to
+# build on Windows" was wrong for current versions.
+peft==0.21.2
+trl==1.16.0
+bitsandbytes==0.50.2
+
+# Optional but recommended on Kaggle:
+#   flash-linear-attention -- Qwen3.5's gated-delta-rule layers fall back to a
+#   correct but MUCH slower reference implementation without it (~7.6s/step on a
+#   GTX 1650 with the fallback). Linux wheels are more reliable than Windows.
+# causal-conv1d is the same story and is usually not worth the trouble.
 #
-# bitsandbytes and causal-conv1d are CUDA extensions. They usually FAIL to
-# build on Windows and generally work on Linux, which is a large part of why
-# real training happens on Kaggle rather than on the local GTX 1650.
-# Qwen3.5 also wants flash-linear-attention for its gated-delta-rule layers;
-# without it transformers falls back to a correct but much slower reference
-# implementation (it prints a warning, and training will crawl).
+# ON KAGGLE, DO NOT `pip install -r requirements.txt`. The torch pin above
+# (2.11.0+cu128, from the cu128 extra index) would replace the CUDA-matched
+# torch Kaggle already ships, which is how a working GPU runtime gets broken.
+# Install only the M4 subset, pinned -- see README "Training on Kaggle", Cell 1.

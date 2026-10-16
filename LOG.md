@@ -276,16 +276,27 @@ came from the wrong data.
 `baseline.json` is tracked in git precisely so that this change is a reviewable
 diff rather than a silent overwrite.
 
-### Known weakness in the current eval
+### Known weakness in the current eval — and a correction
 
-The val split is now 59,549 tokens. Sixty-four windows of 512 tokens, spaced
-evenly, gives ~930 tokens of spacing per window — so **adjacent windows
-overlap by roughly 45%**. Overlapping windows are correlated, which makes the
-reported `±0.089` optimistic: the true noise floor is wider than printed.
+**Correction to an earlier claim.** This log previously said the 64 evaluation
+windows overlap by roughly 45%, making `±0.089` optimistic. **That was
+wrong.** The actual geometry:
 
-Options for M4, in order of preference: shorten windows to 256 (halves the
-overlap), drop to 32 windows, or hold out more files. Until then, treat
-`±0.089` as a floor and require ~`0.18` before believing an improvement.
+```
+spacing between window starts : 937 tokens
+window length                 : 512 tokens
+overlap                       : NONE -- there is a 425-token gap
+coverage of the val split     : 55%
+```
+
+The windows are disjoint, so they do not double-count and `±0.089` is a fair
+estimate. The real limitation is the opposite of what was claimed: the eval
+**only scores 55% of the held-out split** (32,768 of 59,549 tokens). The rest is
+never seen. `evalkit.window_geometry()` now reports both numbers, and
+`baseline.json` records `eval_coverage`, so this cannot be misstated again.
+
+To widen coverage, raise `--windows` toward 116 (the point where 512-token
+windows tile the split exactly). That is the preferred fix for M4.
 
 Also outstanding: a Next.js build-output directory (`.open-next/.build`) still
 contributes ~1.2%. `data.py` skips some generated files but not that one.
@@ -294,18 +305,138 @@ contributes ~1.2%. `data.py` skips some generated files but not that one.
 
 ## M4 — LoRA fine-tune against this baseline
 
-**Status: not started.**
+**Status: built and verified. Not yet run for real.**
 
-Run on Kaggle T4. Success is not "it trained" — it is **1.5098 going down**,
-measured with the identical window method, by more than about `0.18`. The
-noise floor on this eval is `±0.089`, so a drop smaller than that is not
-evidence of anything.
+### What was built
 
-Constraint to plan around: the first-party training set is only **2.88M
-characters (~1M tokens)**. That is enough to teach style and idiom, and not
-enough to teach capability. If M4 stalls, the answer is more data — most
-likely a public code corpus from HuggingFace for breadth, with the first-party
-code used for the fine-tune itself.
+| File | Role |
+| --- | --- |
+| `evalkit.py` | The single implementation of the fixed evaluation. `baseline.py` and `finetune.py` both call it, so their numbers are comparable by construction rather than by promise. |
+| `finetune.py` | QLoRA fine-tune: 4-bit NF4 base, LoRA r=16, gradient checkpointing, cosine LR, periodic eval on the fixed windows, adapter + `result.json` output. |
+| `data.load_cached()` | Loads `corpus-*.json.gz` directly. Without it, cloud training is impossible: `get_corpus()` derives its cache key by walking `data_dirs.txt`, and those `D:\` paths do not exist on Kaggle, so it would silently return nothing. |
+
+### The provenance check
+
+Before training, `finetune.py` verifies the corpus fingerprint, window count,
+window size and model against `baseline.json`, and **exits** on any mismatch.
+This is not decorative: during a smoke test it caught a deliberate
+`--eval-windows 8` mismatch and refused to let the run be interpreted.
+
+### Two findings that changed the design
+
+**1. 4-bit quantisation is not free.** The same model scores:
+
+| | loss | perplexity |
+| --- | --- | --- |
+| fp16 (what `baseline.py` measures) | 1.5098 | 4.526 |
+| 4-bit NF4 (what `finetune.py` starts from) | **1.5955** | 4.931 |
+
+That **+0.086 nats** is the price of fitting a 0.8B model onto cheap hardware.
+
+The consequence matters for honesty: `AFTER` must be compared against the
+4-bit `BEFORE` measured *inside the same run*, not against the full-precision
+`baseline.json` number. Comparing across precisions would credit the fine-tune
+with a loss that came from quantisation. The first version of the check
+compared them naively and "passed" while concealing this; it now separates
+hard provenance failures from expected quantisation drift.
+
+**2. `peft`, `trl` and `bitsandbytes` all work on Windows.** This log
+previously claimed `bitsandbytes` "usually FAILS to build on Windows" and used
+it as a reason to move training to Kaggle. **That is out of date** — current
+versions ship `cp313` wheels. Verified: 6,389,760 trainable of 758,782,784
+(0.84%), 1.31 GB after load, 2.42 GB peak during a training step.
+
+Kaggle is still the right place for M4 — not because of installation pain, but
+because a 4 GB card makes the run slow. The local card stays useful for the
+20-step smoke test, which is what caught finding 1.
+
+### Running it
+
+Kaggle, T4 ×2, four notebook cells. See the README section
+[Training on Kaggle](#training-on-kaggle).
+
+**T4 is Turing (compute 7.5) and has no bf16** — same generation as the local
+1650. `finetune.py` detects this and prints a note rather than silently
+downcasting.
+
+#### Correction: the M4 upload archive was never runnable
+
+The first Kaggle attempt failed with
+`can't open file '/kaggle/working/finetune.py'`. The upload command was written
+for the char-level track and had drifted from M4 in two ways at once:
+
+1. It listed `model.py, data.py, evalkit.py, utf8console.py, baseline.json,
+   requirements.txt` — **`finetune.py` was not on the list.** `model.py` shipped;
+   the script Cell 3 actually invokes did not.
+2. `Compress-Archive -Path cache\corpus-*.json.gz` stores the cache at the
+   archive *root*, dropping the `cache\` prefix. `finetune.py` defaults
+   `--corpus-cache` to `HERE/cache`, and `data.find_cached()` returns `None` for
+   a missing directory — so unzipping to `/kaggle/working` put the corpus where
+   nothing looks for it.
+
+Fixing only (1) would have traded one crash for another. The archive is now
+built with `tar -a -cf`, which preserves the directory layout, so
+`-d /kaggle/working` reproduces the repo exactly. Cell 2 also now asserts that
+`finetune.py` and `cache/` are both present, because a missing script in the
+working directory is indistinguishable from a mistyped command.
+
+The underlying lesson is the same one behind every other entry here: the doc is
+a measurement surface, not narration. "Four notebook cells work" was never
+verified end to end.
+
+#### Correction 2: Kaggle mangles a nested `.gz`, and `cp` skips directories
+
+Two more failures, each hiding a working fix behind a plausible message.
+
+**`cp` without `-r` skipped `cache/`.** Kaggle auto-extracts dataset archives, so
+there is no zip to `unzip` — `cp -r` is the right call. But a plain `cp` copies
+the six scripts, prints `cp: -r not specified; omitting directory`, and **exits
+0**. The scripts ran; the corpus never arrived.
+
+**Kaggle's dataset pipeline destroyed the `.gz`.** With the directory copied, the
+output tree contained
+
+```
+cache/corpus-c7189ca503eb68f1.json          <- a DIRECTORY, not a file
+    corpus-c7189ca503eb68f1.json.gz.tmp
+```
+
+A gzip member nested inside a zip that is itself a Dataset is a triple
+compression stack, and the pipeline replaced the cache file with a directory
+holding a `.tmp`. `find_cached()` filtered on `.json.gz`, matched nothing, and
+returned `None` — so `finetune.py` reported `no corpus cache at None`, a message
+that points at "build the corpus locally", which is the opposite of the truth.
+
+Three fixes, all in `data.py`:
+
+- `load_cached()` distinguishes *no cache directory* from *no cache file* from
+  *the cache path is a directory*, because the three have three different
+  remedies and one of them is "upload a new Dataset".
+- `find_cached()` and `fingerprint_of()` accept plain `corpus-<fp>.json` as well
+  as `.json.gz`, via one `_strip_cache_suffix()` helper. It tries the longer
+  suffix first — otherwise every gzipped cache parses as fingerprint `x.gz`.
+- `find_cached()` now requires `os.path.isfile()`. Without it, the Kaggle
+  directory would have *matched* and produced a far more confusing
+  `IsADirectoryError` further downstream.
+- `data.py --export-plain` writes the uncompressed copy for upload: 0.8 MB
+  becomes 3.1 MB, against 20 GB of working directory.
+
+Note the ordering that made this expensive: the plain file and the mangled
+directory share a name, so you cannot fix it in place. It needs a **new
+Dataset**, not a new version — which is why the first two rounds of debugging
+could not have succeeded from inside the existing one.
+
+### Next
+
+Raise `--eval-coverage` first if a tighter noise floor matters, then run 3
+epochs and read `result.json`. Success is `loss_after` meaningfully below
+`loss_before` **from the same 4-bit run** — not below the full-precision
+baseline.
+
+If the drop is small, that is a real result rather than a failure: ~1M tokens
+of a single codebase is enough to teach style, and not enough to teach
+capability. The next move would be a public code corpus from HuggingFace for
+breadth, with first-party code reserved for the fine-tune.
 
 ---
 
