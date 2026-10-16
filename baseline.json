@@ -5,11 +5,11 @@
   "device": "cuda",
   "windows": 64,
   "seq_len": 512,
-  "chars_per_token": 2.893,
-  "val_chars": 2603687,
-  "val_tokens": 899874,
-  "loss": 1.324012,
-  "loss_se": 0.060823,
-  "perplexity": 3.7585,
-  "seconds": 148.9
+  "chars_per_token": 3.622,
+  "val_chars": 215664,
+  "val_tokens": 59549,
+  "loss": 1.50978,
+  "loss_se": 0.088913,
+  "perplexity": 4.5257,
+  "seconds": 146.4
 }

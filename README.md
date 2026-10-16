@@ -70,11 +70,11 @@ Expect:
 
 ```
 loaded the corpus from cache (add --refresh-data to rebuild it)
-train: 2,040 files, 27,412,052 characters
-val:   215 files, 2,603,687 characters (whole files held out)
-skipped: not read (character cap reached) 5438, duplicate content 101, ...
+train: 549 files, 2,877,167 characters
+val:   44 files, 215,664 characters (whole files held out)
+skipped: minified or generated 51, possible secret 15, duplicate content 13, ...
 biggest sources (to leave one out, add a line to data_dirs.txt starting with !):
-  63.5%  <some vendored library>
+  25.5%  <your own application code>
 ```
 
 **Read this before training** — it is how you spot a folder you did not mean
@@ -93,19 +93,19 @@ Expect roughly:
 ```
 device: cuda
 loaded the corpus from cache (add --refresh-data to rebuild it)
-vocab: 100 characters | encoded train 27,412,052, val 2,603,687
-parameters: 835,428
-loss of pure guessing would be about 4.61
-step     0 | train 4.772+-0.000 | val 4.773+-0.001 |     0s  <- best so far, saved
-step    50 | train 2.757+-0.004 | val 2.815+-0.004 |     4s  <- best so far, saved
-step   100 | train 2.602+-0.005 | val 2.643+-0.005 |     8s  <- best so far, saved
-step   150 | train 2.524+-0.005 | val 2.573+-0.005 |    12s  <- best so far, saved
-step   200 | train 2.434+-0.005 | val 2.485+-0.006 |    15s  <- best so far, saved
+vocab: 99 characters | encoded train 2,877,167, val 215,664
+parameters: 835,171
+loss of pure guessing would be about 4.60
+step     0 | train 4.765+-0.000 | val 4.773+-0.000 |     0s  <- best so far, saved
+step    50 | train 2.723+-0.004 | val 2.910+-0.005 |     4s  <- best so far, saved
+step   100 | train 2.570+-0.004 | val 2.748+-0.005 |     8s  <- best so far, saved
+step   150 | train 2.462+-0.004 | val 2.645+-0.005 |    11s  <- best so far, saved
+step   200 | train 2.362+-0.004 | val 2.534+-0.005 |    15s  <- best so far, saved
 
-best val loss: 2.485
+best val loss: 2.534
 ```
 
-**It worked if** the loss drops well below `4.61` within 50 steps, and
+**It worked if** the loss drops well below `4.60` within 50 steps, and
 `checkpoints/smoke/` contains `curve.csv`, `sample.txt` and `best.pt`.
 
 Two things worth understanding immediately:
@@ -125,13 +125,13 @@ Two things worth understanding immediately:
 Expect:
 
 ```
-tokenized to 899,874 tokens in 2.7s (2.89 chars per token)
-64 fixed windows of 512 tokens (~1481 chars of code each)
+tokenized to 59,549 tokens in 0.2s (3.62 chars per token)
+64 fixed windows of 512 tokens (~1854 chars of code each)
 Qwen/Qwen3.5-0.8B: 752M parameters, nothing fine-tuned yet
 ====================================================================
 BASELINE  Qwen/Qwen3.5-0.8B  (no fine-tuning at all)
-  loss         1.3240 +- 0.0608
-  perplexity   3.758
+  loss         1.5098 +- 0.0889
+  perplexity   4.526
 ====================================================================
 ```
 
@@ -416,8 +416,9 @@ the data pipeline, the evaluation, the tool schemas, and the loop.
 | | M7 | Guardrails, autonomous loop, eval |
 | | M8 | Publish — model card, dataset card, license |
 
-Success in M4 is **not** "it trained." It is `baseline.json`'s `1.3240` going
-down, measured with the identical window method, by more than the noise floor.
+Success in M4 is **not** "it trained." It is `baseline.json`'s `1.5098` going
+down, measured with the identical window method, by more than the noise floor
+of about `0.18` (twice the `±0.089`).
 
 ---
 

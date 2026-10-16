@@ -217,12 +217,95 @@ number taken *before* you started.
 pull CUDA extensions that fail on Windows; installing them here would produce
 a broken half-working environment and a confusing first error on Kaggle.
 
-### Next: M4 — LoRA fine-tune against this baseline
+### The corpus experiment
 
-Run on Kaggle T4. Success is not "it trained" — it is **baseline.json's 1.3240
-going down**, measured with the identical window method, and the size of the
-drop clearing the noise floor. The noise floor on this eval is ±0.06, so a
-drop smaller than ~0.12 is not evidence of anything.
+M1 concluded the corpus was "96% code you didn't write," and left it as advice.
+This is the measurement. One line was added to `data_dirs.txt` — a `!` prefix
+excluding the vendored-requirements folder and everything beneath it — and
+nothing else changed.
+
+| | before | after |
+| --- | --- | --- |
+| train files / chars | 2,040 / 27,412,052 | 549 / 2,877,167 |
+| val files / chars | 215 / 2,603,687 | 44 / 215,664 |
+| **files dropped by the char cap** | **5,438** | **0** |
+| top file type | `.c` 1234 | `.tsx` 150 |
+| files skipped as possible secrets | 7 | **15** |
+| biggest source | one vendored library, 63.5% | own application code, 25.5% |
+
+**The cap stopped binding.** Re-running with `--max-chars 200000000` produced
+byte-identical output: the entire remaining corpus is 3.1M characters, an
+order of magnitude under the old limit. The 5,438 dropped files were never a
+cap problem in the first place — they were a *consequence of the vendored
+folders being walked first*. Excluding those folders removed the pressure.
+
+**The secret scanner found twice as many files** (7 → 15) because first-party
+files are now actually being read. More of the corpus is being inspected, not
+less.
+
+The sample confirms the change end to end. Before:
+
+```
+def ff_video_write_height && ff_vp9_video_field_height) {
+```
+
+After:
+
+```
+def from 'times';
+import { username } from './ww.map.h'
+export function hashWindowScriptort() { Color_->setWindow(tr("object") {
+```
+
+### Every number moved — in the "wrong" direction, on purpose
+
+| measurement | before | after |
+| --- | --- | --- |
+| Qwen3.5-0.8B loss | 1.3240 ± 0.0608 | **1.5098 ± 0.0889** |
+| Qwen3.5-0.8B perplexity | 3.758 | **4.526** |
+| Hanny best val | 1.107 | 1.342 |
+| Hanny vocabulary | 100 | 99 |
+
+**Worse is the correct outcome.** The old 1.3240 was partly credit for
+scoring well on ffmpeg — famously idiomatic C that saturates the public
+internet and was 63.5% of the corpus. 1.5098 is the honest number for
+first-party code, and it is the number fine-tuning actually has to move.
+Reporting 1.3240 would have meant celebrating a measurement advantage that
+came from the wrong data.
+
+`baseline.json` is tracked in git precisely so that this change is a reviewable
+diff rather than a silent overwrite.
+
+### Known weakness in the current eval
+
+The val split is now 59,549 tokens. Sixty-four windows of 512 tokens, spaced
+evenly, gives ~930 tokens of spacing per window — so **adjacent windows
+overlap by roughly 45%**. Overlapping windows are correlated, which makes the
+reported `±0.089` optimistic: the true noise floor is wider than printed.
+
+Options for M4, in order of preference: shorten windows to 256 (halves the
+overlap), drop to 32 windows, or hold out more files. Until then, treat
+`±0.089` as a floor and require ~`0.18` before believing an improvement.
+
+Also outstanding: a Next.js build-output directory (`.open-next/.build`) still
+contributes ~1.2%. `data.py` skips some generated files but not that one.
+
+---
+
+## M4 — LoRA fine-tune against this baseline
+
+**Status: not started.**
+
+Run on Kaggle T4. Success is not "it trained" — it is **1.5098 going down**,
+measured with the identical window method, by more than about `0.18`. The
+noise floor on this eval is `±0.089`, so a drop smaller than that is not
+evidence of anything.
+
+Constraint to plan around: the first-party training set is only **2.88M
+characters (~1M tokens)**. That is enough to teach style and idiom, and not
+enough to teach capability. If M4 stalls, the answer is more data — most
+likely a public code corpus from HuggingFace for breadth, with the first-party
+code used for the fine-tune itself.
 
 ---
 

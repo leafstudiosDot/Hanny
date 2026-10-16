@@ -18,5 +18,8 @@
 
 # Local training data
 /data/
-data_dirs.txt
+# data_dirs*.txt covers data_dirs.txt AND any backup/variant (data_dirs.bak.txt,
+# data_dirs_exclude.txt, ...). data_dirs.tmp.txt is already tracked, and
+# gitignore does not affect tracked files, so the template stays published.
+/data_dirs*.txt
 /cache/
