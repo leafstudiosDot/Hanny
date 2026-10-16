@@ -440,6 +440,67 @@ breadth, with first-party code reserved for the fine-tune.
 
 ---
 
+## M4 — result
+
+Three epochs on Kaggle T4, `r=16`, `alpha=32`, `lr=2e-4`, batch 8 × 512 tokens,
+555 steps in 4305 s. Provenance check passed; corpus fingerprint
+`c7189ca503eb68f1` throughout.
+
+```
+BEFORE  1.5955 +- 0.0523   4-bit nf4, never trained
+AFTER   1.3256             best at step 500 of 555
+CHANGE  0.2699 nats        perplexity 4.931 -> 3.764
+```
+
+That is `4.96x` twice the `±0.0272` standard error — not a marginal result.
+The checkpoint plateaued rather than converged: val was 1.3257 / 1.3256 /
+1.3265 at steps 400 / 500 / 555, so the third epoch bought nothing and the
+train/val gap had opened to 0.386 nats (train 0.9399). **Two epochs would have
+saved ~24 minutes and produced the same adapter.** Raise `--windows` before
+concluding anything tighter than this.
+
+### The comparison nearly went wrong
+
+This section exists because the documented success criterion was wrong and
+would have been misleading even though the answer came out right.
+
+The README previously defined M4 success as `baseline.json`'s `1.5098` going
+down by more than `0.18` (twice `±0.089`). That compares **fp16** against
+**4-bit**, which AGENTS.md rule 3 forbids: the quantisation gap here is
+`0.0857` nats.
+
+| Comparison | Drop | Threshold | Verdict |
+| --- | --- | --- | --- |
+| `BEFORE` vs `AFTER`, same 4-bit run | 0.2699 | 0.0544 | passes 4.96x over |
+| `AFTER` vs fp16 `baseline.json` | 0.1842 | 0.1778 | passes by **0.0064** |
+
+A third of the real effect is eaten by the quantisation gap, and the wrong
+method cleared its bar by 0.006 nats — a coin flip. It would have passed
+identically for a model that learned nothing at all, which is precisely the
+failure mode the criterion was supposed to exclude. Fixed: success is
+`loss_before` vs `loss_after` within one run, always.
+
+Two smaller bugs found while reading `result.json`:
+
+- `baseline_json_loss_full_precision` was hardcoded `None`. `b` is scoped
+  inside the `if os.path.exists(baseline_file)` block, so the writer could not
+  reach it; the value is now captured explicitly once the checks pass.
+- `finetune.py` claimed in AGENTS.md to warn when `flash-linear-attention` is
+  missing, and did not. The Kaggle run sat at 7.4 s/step — roughly what that
+  fallback costs on a *much weaker* card — so it was almost certainly running
+  the slow reference path after a kernel restart silently dropped the Triton
+  extension. `finetune.py` now prints which path it took.
+
+### What this does not show
+
+Perplexity 3.76 on held-out first-party code says the fine-tune learned *this
+codebase*. It says nothing about general ability, and it is measured on 55% of
+the val split. Per AGENTS.md the corpus is ~1M tokens of one project's code:
+enough for style, not for capability. No general-chat eval exists yet, so no
+chatbot claim is supported by this number.
+
+---
+
 ## Log format going forward
 
 Append a section per milestone with: what changed, the config that produced

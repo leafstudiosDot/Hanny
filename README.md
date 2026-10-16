@@ -275,6 +275,61 @@ r = json.load(open("/kaggle/working/checkpoints/m4/result.json"))
 print(json.dumps(r, indent=2))
 ```
 
+### Using both T4s
+
+`finetune.py` is single-process: it binds one process to one GPU and never
+looks at the second. That is a property of the script, not a Kaggle limit.
+`CUDA_VISIBLE_DEVICES` remaps a physical card to `cuda:0`, so no code change is
+needed to use the second one.
+
+**Do the `flash-linear-attention` fix first.** Both runs are bottlenecked on
+the CPU, not on GPU throughput — a run using ~1 GB of a 15 GB card at 7 s/step
+is launch-bound. Two slow runs are still two slow runs. Once `fla` imports,
+this is ~9 minutes per run and running two at a time is obviously worth it.
+
+Because the repo's rule is *one hyperparameter at a time*, two GPUs are worth
+more as **two concurrent experiments** than as one run at half the time:
+
+```python
+# Two runs, one per T4. The --run names MUST differ: both processes otherwise
+# write the same checkpoints/<run>/ directory and corrupt each other's adapter.
+!cd /kaggle/working && CUDA_VISIBLE_DEVICES=0 nohup python finetune.py \
+    --run m4-2ep  --epochs 2 --batch 8 --eval-batch 8 --corpus-cache upload \
+    > /kaggle/working/log-2ep.txt 2>&1 &
+!cd /kaggle/working && CUDA_VISIBLE_DEVICES=1 nohup python finetune.py \
+    --run m4-lr3e4 --epochs 3 --batch 8 --eval-batch 8 --lr 3e-4 --corpus-cache upload \
+    > /kaggle/working/log-lr3e4.txt 2>&1 &
+```
+
+`nohup` and the log redirect are not decoration: without them the cell returns
+with no way to see progress, and a failure in run two is indistinguishable from
+a hang. Watch them with:
+
+```python
+!sleep 180; tail -n 6 /kaggle/working/log-2ep.txt /kaggle/working/log-lr3e4.txt
+```
+
+Then read both results together:
+
+```python
+import json
+for run in ("m4-2ep", "m4-lr3e4"):
+    r = json.load(open(f"/kaggle/working/checkpoints/{run}/result.json"))
+    print(f"{run:9} before {r['loss_before']:.4f} -> after {r['loss_after']:.4f} "
+          f"(change {r['loss_change']:+.4f}, {r['seconds']:.0f}s)")
+```
+
+**Comparing two runs is legitimate here, and only because of `evalkit.py`.**
+`loss_before` is re-measured per run, but from the same fixed windows on the
+same corpus, so it should come out identical across runs — if it does not,
+stop and find out why before trusting either number. Vary `--lr`, `--epochs`,
+`--lora-r` freely. Do **not** vary `--corpus-cache`, `--eval-windows` or
+`--seq-len` between concurrent runs: different windows make the two `AFTER`
+values incomparable in exactly the way `evalkit.py` exists to prevent.
+
+Two 4-bit models at ~1 GB each fit on separate cards with room to spare, so
+there is no VRAM contention to worry about.
+
 ### Six things that will bite you
 
 **Cell 1 does not survive a session restart.** Kaggle's pip installs are
@@ -289,7 +344,9 @@ CUDA-matched torch Kaggle already ships. Cell 1 installs the M4 subset instead.
 
 **GPU 2 sits at 0% and that is expected.** This is a single-process run; nothing
 here uses DDP or device maps, so the second T4 is idle. Two GPUs would roughly
-halve the wall clock, but that is a different recipe, not a switch.
+halve the wall clock, but that is a different recipe, not a switch — see
+[Using both T4s](#using-both-t4s) for the cheap version, which is two
+concurrent experiments rather than one faster one.
 
 **Expect ~80 minutes, not 20.** 555 steps at 4096 tokens each on one T4. If you
 see ~7-9 s/step, check the `flash-linear-attention` line Cell 1 prints: without
@@ -624,15 +681,25 @@ the data pipeline, the evaluation, the tool schemas, and the loop.
 | done | M1 | Character-level GPT from scratch |
 | done | M2 | Fixed evaluation set, standard errors, `curve.csv` |
 | done | M3 | Token-level baseline — the number to beat |
-| next | M4 | LoRA fine-tune against that baseline (Kaggle T4) |
-| | M5 | Tool-calling SFT on this project's own tools |
+| done | M4 | LoRA fine-tune against that baseline (Kaggle T4) |
+| next | M5 | Tool-calling SFT on this project's own tools |
 | | M6 | Supervised CLI agent |
 | | M7 | Guardrails, autonomous loop, eval |
 | | M8 | Publish — model card, dataset card, license |
 
-Success in M4 is **not** "it trained." It is `baseline.json`'s `1.5098` going
-down, measured with the identical window method, by more than the noise floor
-of about `0.18` (twice the `±0.089`).
+**M4 result: `1.5955 → 1.3256`, a drop of `0.2699` nats** (perplexity
+`4.931 → 3.764`) over 555 steps, best at step 500. That is `4.96x` twice the
+`±0.0272` standard error, so it clears the noise floor by a wide margin.
+
+Success in M4 was defined **not** as "it trained," but as a drop larger than
+`2x` the standard error, measured as `loss_before` vs `loss_after` *from the
+same 4-bit run* — never against `baseline.json`'s full-precision `1.5098`. That
+distinction is not pedantic here: the 4-bit quantisation gap is `0.0857` nats,
+which is a third of the entire measured effect. Comparing against the
+full-precision baseline would have reported a drop of `0.1842` and called it a
+narrow pass against a `0.178` threshold — the right answer, arrived at by a
+method that would equally have "passed" a model that only recovered the
+quantisation error and learned nothing.
 
 ---
 

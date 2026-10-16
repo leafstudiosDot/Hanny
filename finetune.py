@@ -142,6 +142,7 @@ pre, pre_se = evalkit.score(base, eval_windows, args.eval_batch, device)
 print("\n" + "=" * 68)
 print(f"BEFORE  val loss {pre:.4f} +- {pre_se:.4f}   (perplexity {math.exp(pre):.3f})")
 baseline_file = os.path.join(HERE, "baseline.json")
+baseline_full_precision = None
 if os.path.exists(baseline_file):
     with open(baseline_file, encoding="utf-8") as f:
         b = json.load(f)
@@ -173,6 +174,7 @@ if os.path.exists(baseline_file):
         for f_ in fatal:
             print(f"  - {f_}")
         raise SystemExit("Fix the above before training.")
+    baseline_full_precision = b["loss"]
     print("provenance check passed: same corpus, same windows, same model")
 else:
     print("no baseline.json found; this run establishes a new one")
@@ -316,7 +318,9 @@ result = {
     "loss_before": round(pre, 6),
     "loss_before_se": round(pre_se, 6),
     "loss_before_precision": "4-bit nf4",
-    "baseline_json_loss_full_precision": None,
+    # Recorded for context only, never as the comparison. fp16-vs-4bit differ by
+    # ~0.09 nats, which is comparable to the effect being measured here.
+    "baseline_json_loss_full_precision": baseline_full_precision,
     "loss_after": round(best_val, 6),
     "loss_change": round(drop, 6),
     "perplexity_before": round(math.exp(pre), 4),
