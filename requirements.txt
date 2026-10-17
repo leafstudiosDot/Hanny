@@ -26,7 +26,13 @@ bitsandbytes==0.50.2
 #   flash-linear-attention -- Qwen3.5's gated-delta-rule layers fall back to a
 #   correct but MUCH slower reference implementation without it (~7.6s/step on a
 #   GTX 1650 with the fallback). Linux wheels are more reliable than Windows.
-# causal-conv1d is the same story and is usually not worth the trouble.
+#   causal-conv1d is the one that actually matters here, and the old note ("same
+#   story, usually not worth the trouble") was WRONG. Without it transformers
+#   prints "`causal_conv1d_fn` is falling back to its reference PyTorch
+#   implementation" and the run stays launch-bound. CUDA extension: on Kaggle,
+#   expect a wheel or a few minutes of nvcc.
+#   Measured on a Kaggle T4: flash-linear-attention moved a 555-step run from
+#   4305s to 3960s, only 1.09x. Worth having, but not the 7x one might expect.
 #
 # ON KAGGLE, DO NOT `pip install -r requirements.txt`. The torch pin above
 # (2.11.0+cu128, from the cu128 extra index) would replace the CUDA-matched

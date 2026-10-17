@@ -198,29 +198,59 @@ attach directly, and you need somewhere to put the corpus.
 
 ### What to upload
 
-The corpus, prepared locally. It is **0.80 MB** and lives in
-`cache/corpus-<fingerprint>.json.gz`.
+`pack.py` builds the archives. Do not hand-write the file list — an earlier
+version of this section was a `Compress-Archive` line in the README that
+silently omitted `finetune.py`, and the resulting Kaggle failure
+(`No such file or directory`) looked like a broken upload rather than a broken
+doc.
 
 ```powershell
-.venv\Scripts\python.exe data.py --export-plain upload
-tar -a -cf hanny-kaggle.zip upload\corpus-*.json finetune.py data.py evalkit.py utf8console.py baseline.json model.py requirements.txt
+.venv\Scripts\python.exe pack.py            # both archives
+.venv\Scripts\python.exe pack.py --check    # verify only, builds nothing
 ```
 
-> **Why the corpus is uploaded uncompressed.** A `.json.gz` nested inside the
-> zip is a triple compression stack, and Kaggle's dataset pipeline mangles it:
+It writes two archives, split by who is allowed to see them:
+
+| Archive | Contains | Publishable? |
+| --- | --- | --- |
+| `hanny-code.zip` | all scripts, `baseline.json`, the public probe sets | **yes** |
+| `hanny-data.zip` | the corpus cache, the real safety probes | **no** |
+
+> **The corpus is uploaded uncompressed.** A `.json.gz` nested inside a zip is a
+> triple compression stack, and Kaggle's dataset pipeline mangles it:
 > `cache/corpus-<fp>.json.gz` came back as a *directory* called
-> `corpus-<fp>.json` holding a `.json.gz.tmp` file, so `find_cached()` matched
+> `corpus-<fp>.json` holding a `.json.gz.tmp`, so `find_cached()` matched
 > nothing and `finetune.py` died on a `None` path. Plain JSON skips that
 > pipeline entirely — 0.8 MB becomes 3.1 MB, against 20 GB of working dir.
 > Locally the cache stays gzipped; `data.py` reads both forms.
 
-> **Keep the dataset private.** The cache contains your source code *and* 77
-> folder paths plus 15 secret-file paths in its `report` block. It is not
-> indexed while private. Do not make it public without stripping `report`.
+> **`pack.py` refuses to build `hanny-code.zip` if it leaks.** It scans every
+> shareable file for every folder path and source filename recorded in the
+> private corpus `report`, plus the gitignored probe phrasings, then re-scans the
+> finished archive's bytes — because the pre-build pass cannot see content the
+> packager generates itself. It caught a real one on its first run: a company
+> name in the License section below.
+>
+> If it flags something deliberate, such as the copyright line naming the
+> holder, record it in `pack.local.json` (gitignored) rather than deleting the
+> check. That file carries the reasoning too, and every entry is reprinted on
+> each run, so an allowance stays visible instead of becoming something nobody
+> remembers adding. Do not use it for folder paths or secret filenames — that is
+> the one case where being wrong publishes someone's private source tree.
 
-Upload `hanny-kaggle.zip` as a **private Kaggle Dataset**. Name it after the
-fingerprint, e.g. `hanny-corpus-c7189ca5`, so the name says which corpus a run
-used — that hash changes automatically whenever the corpus does.
+### Uploading
+
+Upload **both** zips as a **private Kaggle Dataset**, named after the
+fingerprint — `hanny-corpus-c7189ca5` — so the name says which corpus a run used.
+That hash changes automatically whenever the corpus does.
+
+Keep it private. `hanny-data.zip` contains your source code, 77 folder paths and
+the names of 15 secret-bearing files. Do not make it public without stripping
+the `report` block.
+
+Attach it as **one** dataset and unpack both archives in Cell 2 — that is what
+the cells below do. Splitting them into two separate datasets is also valid, and
+worth doing if you want to rotate the private half without republishing code.
 
 ### Notebook cells
 
@@ -235,8 +265,14 @@ used — that hash changes automatically whenever the corpus does.
 # subset instead, pinned to what requirements.txt already verified.
 !pip install -q "transformers==5.20.0" "accelerate==1.15.0" "huggingface-hub==2.2.0" "peft==0.21.2" "trl==1.16.0" "bitsandbytes==0.50.2"
 # Optional, big speedup. Qwen3.5's gated-delta-rule layers fall back to a slow
-# reference implementation without it (~7.6s/step on a GTX 1650).
+# reference implementation without it. Measured here: installing it moved a
+# 555-step run from 4305s to 3960s, i.e. only 1.09x -- less than you would hope.
 !pip install -q flash-linear-attention
+# This is the one that actually matters. Without it transformers prints
+# "`causal_conv1d_fn` is falling back to its reference PyTorch implementation",
+# and the run is launch-bound at ~7s/step on a T4. CUDA extension, so this may
+# compile against nvcc for a few minutes.
+!pip install -q causal-conv1d
 
 # Verify, because a silent -q install failure resurfaces 2 minutes into Cell 3.
 from importlib.metadata import version
@@ -246,15 +282,20 @@ assert _v("bitsandbytes") >= (0, 46), "bitsandbytes < 0.46.1: 4-bit will not loa
 ```
 
 ```python
-# Cell 2 - unpack and check the GPU
-# Kaggle auto-extracts dataset archives, so hanny-kaggle.zip is already expanded
-# under /kaggle/input. The -r matters: upload/ is a directory, and a plain `cp`
-# skips it with a warning while still exiting 0 -- the corpus then goes missing.
-!cp -r /kaggle/input/datasets/<your-user>/hanny-corpus-c7189ca5/* /kaggle/working
+# Cell 2 - unpack both archives and check the GPU
+# Kaggle auto-extracts the dataset zip, so both hanny-*.zip are already
+# expanded under /kaggle/input. Unpack each into /kaggle/working.
+# The -r matters: upload/ and evalsets/ are directories, and a plain `cp`
+# skips them with a warning while still exiting 0 -- the corpus then goes
+# missing and Cell 3 dies on a None path.
+!cp -r /kaggle/input/datasets/<your-user>/hanny-corpus-c7189ca5/hanny-code.zip /kaggle/working/
+!cp -r /kaggle/input/datasets/<your-user>/hanny-corpus-c7189ca5/hanny-data.zip /kaggle/working/
+!cd /kaggle/working && unzip -q hanny-code.zip -d . && unzip -q hanny-data.zip -d . && rm -f hanny-*.zip
 import os, torch
-# All three must pass before Cell 3. A missing script or corpus in
+# All four must pass before Cell 3. A missing script or corpus in
 # /kaggle/working otherwise reads like a bad command rather than a bad copy.
 print(sorted(os.listdir("/kaggle/working")))        # 'finetune.py' must be listed
+print(sorted(os.listdir("/kaggle/working/evalsets")))
 print(sorted(os.listdir("/kaggle/working/upload")))  # ['corpus-<fp>.json']
 print(os.path.getsize("/kaggle/working/upload/corpus-c7189ca503eb68f1.json"))
 print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
@@ -348,10 +389,10 @@ halve the wall clock, but that is a different recipe, not a switch — see
 [Using both T4s](#using-both-t4s) for the cheap version, which is two
 concurrent experiments rather than one faster one.
 
-**Expect ~80 minutes, not 20.** 555 steps at 4096 tokens each on one T4. If you
-see ~7-9 s/step, check the `flash-linear-attention` line Cell 1 prints: without
-it the gated-delta-rule layers run a reference implementation and the run takes
-several times longer.
+**Expect ~65 minutes, not 20.** 555 steps at 4096 tokens each on one T4. If
+you see ~7 s/step, look for the `causal_conv1d_fn` fallback warning from
+transformers — that kernel is the bottleneck, not the GPU. `fla` alone is only
+worth about 1.09x.
 
 **Kaggle mangles a `.gz` nested inside your dataset archive.** It returned a
 *directory* named `corpus-<fp>.json` where the cache file should be, so
@@ -365,10 +406,10 @@ new version of the old one.
 `cp: -r not specified; omitting directory` and carries on, so the corpus is
 silently absent and Cell 3 dies with `no corpus cache at None`. Use `cp -r`.
 
-**Kaggle snapshots the input dataset at session start.** After you rebuild
-`hanny-kaggle.zip`, an already-open notebook keeps reading the *old* version.
+**Kaggle snapshots the input dataset at session start.** After you rebuild the
+archives with `pack.py`, an already-open notebook keeps reading the *old* version.
 Publish the fix as a new Dataset version and start a fresh session, or Cell 2
-will keep unpacking the broken archive.
+will keep unpacking the stale archive.
 
 **T4 is Turing, compute capability 7.5 — it has no bf16.** That is the same
 generation as your GTX 1650. Any recipe that hardcodes `bf16=True` fails or
@@ -655,16 +696,77 @@ The things that will waste an afternoon if you don't know them.
 | --- | --- |
 | `model.py` | Character-level training / eval / generate, one script |
 | `finetune.py` | M4 LoRA fine-tune of `Qwen3.5-0.8B` with a provenance check |
+| `chateval.py` | Scores base-vs-adapter on chat ability and refusal behaviour |
+| `pack.py` | Builds the upload archives and refuses to publish a leak |
 | `data.py` | Corpus collector with secret-scanning and caching |
 | `evalkit.py` | The one fixed-evaluation implementation, shared by all scripts |
 | `baseline.py` | Scores a pretrained model on the same held-out code |
 | `utf8console.py` | Makes non-ASCII printing safe on Windows consoles |
 | `gpu_check.py` | CUDA availability check and CPU-vs-GPU benchmark |
+| `evalsets/` | The probe sets `chateval.py` scores — see its [README](evalsets/README.md) |
 | `baseline.json` | The M3 baseline, with corpus fingerprint |
 | `LOG.md` | Build log, one section per milestone |
 | `data_dirs.tmp.txt` | Template for `data_dirs.txt` |
 | `AGENTS.md` | Notes for coding agents working in this repo |
 | `checkpoints/` | Per-run artifacts — gitignored, local only |
+
+---
+
+## Checking a fine-tune did not break the chatbot
+
+M4 improved code perplexity and said nothing at all about whether the model can
+still hold a conversation or refuse anything. `chateval.py` is the gate that
+answers that, and it runs on the 1650 — no Kaggle needed.
+
+```bash
+# once, for the reference every later run is compared against
+.venv\Scripts\python.exe chateval.py
+
+# base vs a saved adapter, in one process at one precision
+.venv\Scripts\python.exe chateval.py --adapter checkpoints/m4/adapter-best --show-probes 3
+```
+
+Three things it will not let you do:
+
+- **Compare across precision.** Base and adapter are loaded and scored in the
+  same process at the same precision. A 4-bit adapter against an fp16 baseline
+  is the M4 mistake all over again.
+- **Read one refusal number.** It prints *refused when it should* and *answered
+  when it should* separately, because a model that refuses everything scores a
+  perfect refusal rate and is useless.
+- **Believe a difference smaller than `2xse`.** The chat number is reported as
+  mean ± standard error over pairs.
+
+**The probe sets are smoke tests, not measurements.** 15 chat pairs and 26 safety
+probes is far too few to support a claim about general ability, and the script
+says so on every run. Treat it as a tripwire that catches gross regressions, and
+grow `evalsets/` before trusting anything finer.
+
+Refusal detection is substring matching, which is a proxy in both directions: it
+misses refusals phrased unusually, and it will call a helpful answer a refusal if
+it opens with an apology. It was wrong once already — the first marker list
+reported a safety regression that was entirely the matcher's fault. Use
+`--show-probes` and read the replies before believing any refusal number.
+
+### The safety probes are not in git, on purpose
+
+`evalsets/safety_probe.jsonl` holds real red-team phrasings and is **gitignored**.
+`evalsets/safety_probe_public.jsonl` keeps the same harm categories with the
+wording abstracted, and is committed.
+
+The reason is that a short functional string is harmless on its own, but a
+repository full of them reads as what the Hugging Face Content Policy lists
+under Restricted Content → Harmful or Abusive Content — *"content that attempts to generate malicious code"* — with
+account suspension among the listed sanctions. Intent is not something an
+automated flag or a casual reader of a diff gets to assess.
+
+Practically: `chateval.py` prefers the real file, falls back to the redacted one,
+prints which it used, and records `safety_probe_kind` in `result.json`. **The
+two are not comparable** — `[probe: *]` is not a refusal probe, the
+model just answers the literal string — so a public-set run's refusal numbers
+should be ignored. It still ships to Kaggle: `pack.py` builds `hanny-data.zip`
+from an explicit file list, not a directory sweep, so the gitignore rule does
+not apply. Full reasoning in [`evalsets/README.md`](evalsets/README.md).
 
 ---
 
@@ -682,7 +784,9 @@ the data pipeline, the evaluation, the tool schemas, and the loop.
 | done | M2 | Fixed evaluation set, standard errors, `curve.csv` |
 | done | M3 | Token-level baseline — the number to beat |
 | done | M4 | LoRA fine-tune against that baseline (Kaggle T4) |
-| next | M5 | Tool-calling SFT on this project's own tools |
+| gate | M5-gate | General-chat ability + refusal eval (`chateval.py`) — **done** |
+| next | M5 | Chat-template training data, mixed with general instruction data |
+| | M5b | Tool-calling SFT on this project's own tools |
 | | M6 | Supervised CLI agent |
 | | M7 | Guardrails, autonomous loop, eval |
 | | M8 | Publish — model card, dataset card, license |
@@ -707,6 +811,12 @@ quantisation error and learned nothing.
 
 **Apache License 2.0** — see [`LICENSE`](LICENSE). Copyright 2026
 leafstudiosDot.
+
+Built and published by leafstudiosDot. That name appears here on purpose: it is
+the copyright holder, and an unambiguous attribution is what makes a licence
+work. It is recorded in `pack.local.json` so the packaging leak scan knows the
+difference between deliberate attribution and a folder path that leaked out of
+the corpus — a distinction `pack.py` cannot make on its own.
 
 Apache-2.0 over MIT mainly for the explicit patent grant in §3, which MIT does
 not provide. The tradeoff is §4(b): anyone who modifies these files must mark
