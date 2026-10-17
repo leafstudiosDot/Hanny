@@ -218,22 +218,45 @@ sched = torch.optim.lr_scheduler.OneCycleLR(
     opt, max_lr=args.lr, total_steps=max(1, int(total_steps)),
     pct_start=0.1, anneal_strategy="cos", cycle_momentum=False, div_factor=10, final_div_factor=10)
 
+# Which fast kernels were actually live when this measurement was taken. Both are
+# recorded in result.json, because wall clock depends on them and a result that
+# does not say which kernels it ran on cannot be compared with another result on
+# speed. Neither is "several times faster" -- see the measured numbers below.
+#
 # Qwen3.5 is hybrid: gated-delta-rule (linear attention) layers sit beside
 # full-attention layers. With flash-linear-attention present they take a fused
-# Triton path; without it transformers falls back to a reference implementation
-# that is several times slower. A fresh `pip install flash-linear-attention`
-# usually is NOT importable until the Kaggle kernel restarts, so this check is
-# worth printing rather than assuming -- the symptom is "it just runs slowly"
-# with no error anywhere.
+# Triton path; without it transformers falls back to a reference implementation.
+# A fresh `pip install flash-linear-attention` usually is NOT importable until
+# the Kaggle kernel restarts, so this check is worth printing rather than
+# assuming -- the symptom is "it just runs slowly" with no error anywhere.
+kernels = {"flash_linear_attention": None, "causal_conv1d": None}
 try:
     import fla  # noqa: F401
-    print(f"flash-linear-attention {getattr(fla, '__version__', 'unknown')}: "
+    kernels["flash_linear_attention"] = getattr(fla, "__version__", "unknown")
+    print(f"flash-linear-attention {kernels['flash_linear_attention']}: "
           f"gated-delta-rule layers take the fast path")
 except ImportError:
     print("WARNING: flash-linear-attention is not importable. The gated-delta-rule "
-          "layers are on the slow reference implementation -- expect roughly 7 s/step "
-          "instead of ~1. Fix: pip install flash-linear-attention, then RESTART the "
-          "Kaggle kernel and re-run. Do not ignore this line.")
+          "layers are on the reference implementation. Measured on a Kaggle T4, 555 "
+          "steps at batch 8x512: 4305s without, 3960s with -- 1.09x, not the order of "
+          "magnitude the fallback path suggests. Fix: pip install "
+          "flash-linear-attention, then RESTART the Kaggle kernel and re-run.")
+
+# causal_conv1d is the other kernel transformers may fall back on, and this one
+# is a CUDA extension that builds against nvcc -- on Kaggle's current image the
+# build fails outright, so "not installed" is the normal state of a Cell 1 run.
+# Exception rather than ImportError because a half-built extension raises OSError
+# on import. Measured, because the claim it used to carry was wrong: a run with
+# fla and WITHOUT causal_conv1d finished in 3977s (7.17 s/step) against 3960s
+# (7.14 s/step) for the reference run. It is not the bottleneck; ~7 s/step is
+# simply what this model costs on a T4.
+try:
+    import causal_conv1d  # noqa: F401
+    kernels["causal_conv1d"] = getattr(causal_conv1d, "__version__", "unknown")
+except Exception:  # noqa: BLE001 - presence probe, any failure means "not there"
+    kernels["causal_conv1d"] = False
+print(f"causal_conv1d: {kernels['causal_conv1d'] or 'ABSENT -- transformers uses its reference conv path'}"
+      " (not the bottleneck; see README)")
 
 curve = os.path.join(OUT, "curve.csv")
 with open(curve, "w", encoding="utf-8") as f:
@@ -318,6 +341,9 @@ result = {
     "loss_before": round(pre, 6),
     "loss_before_se": round(pre_se, 6),
     "loss_before_precision": "4-bit nf4",
+    # Which fast kernels were importable for THIS run. "seconds" below is only
+    # comparable against a run whose values here match.
+    "kernels": kernels,
     # Recorded for context only, never as the comparison. fp16-vs-4bit differ by
     # ~0.09 nats, which is comparable to the effect being measured here.
     "baseline_json_loss_full_precision": baseline_full_precision,

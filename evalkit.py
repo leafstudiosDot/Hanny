@@ -31,9 +31,25 @@ file also owns two chat measurements, with the same discipline:
                   should not be. Both halves matter: a model that refuses
                   everything scores a perfect refusal rate and is useless.
 
+and, because both of those score every model against the SAME fixed input set,
+this file also owns how two models are compared on it:
+
+  paired_se()    - standard error of a base-vs-adapter difference over identical
+                   items. The difference is paired, not two independent means.
+  mcnemar_exact()- two-sided exact test on the discordant pairs of a paired
+                   binary outcome, which is what a refusal flip is.
+
+Neither of those was here when they were needed, and chateval.py improvised its
+own: it printed the adapter's own standard error next to the difference between
+two models, and sized the refusal rates' error bars with 26 probes when one rate
+was over 10. Both mistakes pushed in the same direction -- the gate could not
+resolve a real effect. See the comments on each function for the arithmetic.
+
 Refusal detection is pattern matching on generated text. It is a proxy, not a
 safety guarantee -- see REFUSAL_MARKERS.
 """
+from math import comb
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -215,6 +231,64 @@ def chat_score(model, rendered, pad_id, batch, device):
     mean = float(a.mean())
     se = float(a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else float("nan")
     return mean, se, per_pair
+
+
+# Comparing two models on the same items.
+#
+# Every measurement in this file scores each model against an identical input
+# set, so a base-vs-adapter difference is a PAIRED statistic. Reading it as two
+# independent means is wrong twice over: it discards the correlation between
+# the models, and it hides how few items actually moved.
+
+
+def paired_se(before, after):
+    """Mean and standard error of (before - after) over identical items.
+
+    Pass the two per-item arrays in the same order. Both models must have been
+    scored on byte-identical input: chat_score() guarantees that while the
+    caller reuses one tokenizer and one --max-len for every model, and pairing
+    degrades to a guess the moment that stops being true.
+
+    This is the correct noise floor for a base-vs-adapter difference, and it is
+    normally much tighter than either model's own standard error -- the two
+    models are mostly wrong about the same items in the same direction, and
+    that shared part is exactly what the difference cancels out.
+
+    Returns (mean_diff, se). se is NaN below two items.
+    """
+    b = np.asarray(before, dtype=np.float64)
+    a = np.asarray(after, dtype=np.float64)
+    if b.shape != a.shape:
+        raise ValueError(
+            f"paired_se needs matching arrays, got {b.shape} and {a.shape}")
+    d = b - a
+    n = len(d)
+    se = float(d.std(ddof=1) / np.sqrt(n)) if n > 1 else float("nan")
+    return float(d.mean()), se
+
+
+def mcnemar_exact(b, c):
+    """Two-sided exact McNemar test on the discordant pairs. Returns p in [0, 1].
+
+    b = items the first model got one way and the second got the other, in
+    favour of the first. c = the same, in favour of the second. Concordant
+    pairs say nothing about whether the models differ and are correctly
+    ignored -- which is the whole point, because a set of 26 probes where the
+    two models agree on 25 has one bit of information in it, not 26.
+
+    Under H0 the discordant pairs split evenly, so b ~ Binomial(b + c, 0.5).
+    Exact, with no normal approximation: at the probe-set sizes this repo
+    actually uses, b + c is often 1, where a chi-square approximation reports
+    significance for a single flipped probe.
+    """
+    b, c = int(b), int(c)
+    if b < 0 or c < 0:
+        raise ValueError(f"discordant counts must be >= 0, got b={b} c={c}")
+    n = b + c
+    if n == 0:
+        return 1.0  # nothing moved, so there is nothing to test
+    tail = sum(comb(n, k) for k in range(0, min(b, c) + 1)) / (2.0 ** n)
+    return min(1.0, 2.0 * tail)
 
 
 # Refusal behaviour.

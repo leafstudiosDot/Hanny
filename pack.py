@@ -72,14 +72,37 @@ CODE_FILES = [
     "evalsets/chat_probe.jsonl",
     "evalsets/safety_probe_public.jsonl",
     "evalsets/README.md",
+    # The chat track. lorewrite.py imports lorekit, so all three travel
+    # together; listing two of them would import-fail on Kaggle with a
+    # ModuleNotFoundError that reads like a code bug. This is the second time
+    # this list has silently dropped a script the notebook actually runs, so
+    # pack.py aborts when a listed file is missing -- but it cannot abort on a
+    # file nobody remembered to list. See check_code_files().
+    "lorekit.py",
+    "loreeval.py",
+    "lorewrite.py",
 ]
 
 # Private. The corpus is found by fingerprint, not by name, because the
 # fingerprint changes whenever the corpus does and a stale hardcoded name is how
 # you train on the wrong data without noticing.
+# Private files: the corpus cache, the real safety probes, and the lore corpus.
+#
+# Lore is OPTIONAL and that is deliberate. The corpus cache and the probes are
+# required because the Kaggle cells cannot run without them. The lore corpus is
+# not: a clone with no lore folder must still be able to build a code archive,
+# and making lore required would turn "I have no lore yet" into "pack.py
+# crashes", which is the wrong way round. Entries are (folder, pattern, required).
+#
+# Lore goes in the PRIVATE archive only. It is other people's copyrighted
+# writing; hanny-code.zip stays publishable, and a lore file in it would be a
+# leak the post-build scan cannot see, because that scan only reads what it is
+# about to ship.
 DATA_GLOBS = [
-    ("upload", "corpus-*.json"),
-    ("evalsets", "safety_probe.jsonl"),
+    ("upload", "corpus-*.json", True),
+    ("evalsets", "safety_probe.jsonl", True),
+    ("lore/corpus", "**/*.md", False),
+    ("lore/probes", "*.jsonl", False),
 ]
 
 # Strings that must never appear in the shareable archive. Built from the real
@@ -132,18 +155,31 @@ def _is_distinctive(segment):
 
 
 def find_private_files():
-    """Resolve DATA_GLOBS to concrete files. Returns [(arcname, abspath)]."""
+    """Resolve DATA_GLOBS to concrete files. Returns [(arcname, abspath)].
+
+    A missing REQUIRED glob is fatal and says how to create it. A missing
+    optional glob is reported and skipped -- see the comment on DATA_GLOBS for
+    why lore is optional and the corpus cache is not.
+    """
     import glob
     found = []
-    for folder, pattern in DATA_GLOBS:
-        hits = sorted(glob.glob(os.path.join(HERE, folder, pattern)))
+    skipped = []
+    for folder, pattern, required in DATA_GLOBS:
+        hits = sorted(glob.glob(os.path.join(HERE, folder, pattern),
+                                recursive=True))
         if not hits:
-            raise SystemExit(
-                f"no file matching {folder}/{pattern}\n"
-                f"  Run:  .venv\\Scripts\\python.exe data.py --export-plain upload")
+            if required:
+                raise SystemExit(
+                    f"no file matching {folder}/{pattern}\n"
+                    f"  Run:  .venv\\Scripts\\python.exe data.py --export-plain upload")
+            skipped.append(f"{folder}/{pattern}")
+            continue
         for path in hits:
             arc = os.path.relpath(path, HERE).replace("\\", "/")
             found.append((arc, path))
+    if skipped:
+        print("optional inputs not present, skipping: " + ", ".join(skipped))
+        print("  (a clone with no lore corpus still builds both archives)")
     return found
 
 

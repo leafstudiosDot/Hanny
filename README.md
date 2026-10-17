@@ -209,12 +209,32 @@ doc.
 .venv\Scripts\python.exe pack.py --check    # verify only, builds nothing
 ```
 
+Re-run this **after any change to a script, to `lore/`, or to `baseline.json`**.
+The notebooks read the archive, not your working tree: an already-open Kaggle
+notebook keeps running the version that was uploaded, so editing `lorewrite.py`
+locally changes nothing until you rebuild and upload a new Dataset version.
+
+Confirm what went where — this is the check that matters, because a lore file in
+the publishable archive is a leak the post-build scan cannot catch (it only
+reads the files it is about to ship):
+
+```powershell
+.venv\Scripts\python.exe -c "import zipfile; print('PRIVATE:'); [print(' ',n) for n in sorted(zipfile.ZipFile('hanny-data.zip').namelist())]"
+.venv\Scripts\python.exe -c "import zipfile; h=[n for n in zipfile.ZipFile('hanny-code.zip').namelist() if 'lore' in n.lower()]; print('PUBLISHABLE clean' if not h else f'LEAK: {h}')"
+```
+
 It writes two archives, split by who is allowed to see them:
 
 | Archive | Contains | Publishable? |
 | --- | --- | --- |
 | `hanny-code.zip` | all scripts, `baseline.json`, the public probe sets | **yes** |
-| `hanny-data.zip` | the corpus cache, the real safety probes | **no** |
+| `hanny-data.zip` | the code corpus cache, the real safety probes, the **lore corpus and its retrieval probes** | **no** |
+
+The lore corpus is the reason the split exists in the shape it does. It is other
+people's copyrighted writing, so it goes in the **private** archive and never in
+`hanny-code.zip`. `pack.py` treats it as an *optional* input: a clone with no
+`lore/` folder still builds both archives, because "I have no lore yet" must not
+mean "the packager crashes".
 
 > **The corpus is uploaded uncompressed.** A `.json.gz` nested inside a zip is a
 > triple compression stack, and Kaggle's dataset pipeline mangles it:
@@ -264,21 +284,39 @@ worth doing if you want to rotate the private half without republishing code.
 # cu128 index, which would replace Kaggle's CUDA-matched torch. Install the M4
 # subset instead, pinned to what requirements.txt already verified.
 !pip install -q "transformers==5.20.0" "accelerate==1.15.0" "huggingface-hub==2.2.0" "peft==0.21.2" "trl==1.16.0" "bitsandbytes==0.50.2"
-# Optional, big speedup. Qwen3.5's gated-delta-rule layers fall back to a slow
-# reference implementation without it. Measured here: installing it moved a
-# 555-step run from 4305s to 3960s, i.e. only 1.09x -- less than you would hope.
+# Worth having, but measured at 1.09x, not the order of magnitude the fallback
+# implies: 555 steps on a T4 went 4305s -> 3960s.
 !pip install -q flash-linear-attention
-# This is the one that actually matters. Without it transformers prints
-# "`causal_conv1d_fn` is falling back to its reference PyTorch implementation",
-# and the run is launch-bound at ~7s/step on a T4. CUDA extension, so this may
-# compile against nvcc for a few minutes.
-!pip install -q causal-conv1d
+# This used to be documented as "the one that actually matters", with the run
+# launch-bound at ~7s/step without it. Tested: it is not. With fla installed and
+# causal-conv1d ABSENT (which is the normal state here -- it builds against nvcc
+# and the wheel build fails on Kaggle's image) a run finished in 3977s, 7.17
+# s/step, against 3960s / 7.14 s/step for the reference run. transformers prints
+# "causal_conv1d_fn is falling back to its reference PyTorch implementation";
+# that warning is noise, and ~7 s/step is what this model costs on a T4.
+!pip install -q causal-conv1d || true
 
 # Verify, because a silent -q install failure resurfaces 2 minutes into Cell 3.
+# The two kernel packages are checked too, because above all they are the ones
+# that fail silently: Cell 1 already shipped once with causal-conv1d failing to
+# build and this block reporting nothing, since it only asserted the core five.
 from importlib.metadata import version
 def _v(pkg): return tuple(int(x) for x in version(pkg).split(".")[:2])
 print({p: version(p) for p in ("bitsandbytes", "transformers", "peft", "trl", "accelerate")})
 assert _v("bitsandbytes") >= (0, 46), "bitsandbytes < 0.46.1: 4-bit will not load"
+for _p in ("flash-linear-attention", "causal-conv1d"):
+    try:
+        __import__("fla" if _p.startswith("flash") else "causal_conv1d")
+        print(f"{_p}: importable")
+    except Exception:
+        # causal-conv1d routinely fails to build on Kaggle and costs ~0.4% of
+        # wall clock; only fla is worth chasing, and only after a kernel restart.
+        print(f"{_p}: NOT importable -- {'expected here' if 'causal' in _p else 'fix: pip install, then RESTART the kernel'}")
+# The gradio/diffusers "huggingface-hub 2.2.0 is incompatible" resolver warnings
+# that the install printed are benign and expected: the M4 subset needs hf-hub
+# 2.x, Kaggle's image ships gradio pinned to 1.x, and nothing here imports
+# gradio. Do not "fix" them by downgrading huggingface-hub -- that breaks
+# trl 1.16.
 ```
 
 ```python
@@ -316,6 +354,63 @@ r = json.load(open("/kaggle/working/checkpoints/m4/result.json"))
 print(json.dumps(r, indent=2))
 ```
 
+### The chat track — writing a cited document
+
+Cells 3 and 4 train on code. These write a document that *cites* sources, which
+is a different pipeline and a different measurement. They need **no adapter**:
+the lore corpus is retrieval material, not training material, and the two
+tracks share only the base model.
+
+The lore corpus ships inside `hanny-data.zip`, so Cell 2 already put it in
+`/kaggle/working/lore/`. Nothing extra to upload.
+
+```python
+# Cell 5 - the retriever's instrument check
+# Run this first. It is 1 second and it tells you whether the lore corpus
+# actually unpacked and whether the probes shipped with it. If this is red,
+# Cell 6's output means nothing -- do not read a FAIL there as a model result.
+!cd /kaggle/working && python loreeval.py --retrieval
+```
+
+```python
+# Cell 6 - write a document and score it
+#
+# --repetition-penalty 1.15 is not cosmetic. Greedy decoding produced 336
+# characters of a repeated heading on the same question; 1.15 produced usable
+# prose. Do not "clean this up" to greedy.
+#
+# --model is the ceiling test. Change ONLY this flag to compare models on the
+# same question, same corpus, same k, same gate. Everything else identical.
+#
+# Reads /kaggle/working/lore/corpus automatically, writes the document plus a
+# .json of provenance (model, question, retrieved chunks, prompt hash) to
+# /kaggle/working/lore/generated/.
+!cd /kaggle/working && python lorewrite.py \
+    --ask "Who is Gurigura's master and why?" \
+    --k 6 \
+    --max-new-tokens 900 \
+    --repetition-penalty 1.15 \
+    --model Qwen/Qwen3.5-0.8B
+```
+
+```python
+# Cell 7 - score a saved document on its own
+# lorewrite.py already scores what it just wrote, so this is for re-scoring an
+# older document, or one you edited by hand. Exit code 1 = the gate failed,
+# which is a result, not a crash.
+!cd /kaggle/working && python loreeval.py --doc lore/generated/<name>.md
+```
+
+**A FAIL here is the normal outcome, and the reasons are the finding.** The
+three checks are string-level and cannot tell a correct reading of a source from
+a fluent misreading of it. A model can invent a plausible mechanic, use only
+words that genuinely appear in your corpus, and pass every check — that has
+already happened. Read the document; the gate is a floor, not a verdict.
+
+To collect results, enable **Save output → Save and run all**, then download
+`/kaggle/working/lore/generated/`. Each document sits next to the `.json`
+recording exactly which chunks produced it.
+
 ### Using both T4s
 
 `finetune.py` is single-process: it binds one process to one GPU and never
@@ -325,8 +420,10 @@ needed to use the second one.
 
 **Do the `flash-linear-attention` fix first.** Both runs are bottlenecked on
 the CPU, not on GPU throughput — a run using ~1 GB of a 15 GB card at 7 s/step
-is launch-bound. Two slow runs are still two slow runs. Once `fla` imports,
-this is ~9 minutes per run and running two at a time is obviously worth it.
+is launch-bound, and that is exactly why `fla` buys 1.09x rather than 5x: it
+replaces one dispatch path, it does not make the run compute-bound. Two slow
+runs are still two slow runs. At ~66 minutes per run, running two at a time is
+obviously worth it.
 
 Because the repo's rule is *one hyperparameter at a time*, two GPUs are worth
 more as **two concurrent experiments** than as one run at half the time:
@@ -371,6 +468,27 @@ values incomparable in exactly the way `evalkit.py` exists to prevent.
 Two 4-bit models at ~1 GB each fit on separate cards with room to spare, so
 there is no VRAM contention to worry about.
 
+**`lorewrite.py` also works two-at-a-time**, and the same rule applies with one
+extra wrinkle: `--model` is the *point* of the comparison, so vary nothing else
+between the two cards.
+
+```python
+# The ceiling test, both T4s, same question. One variable: --model.
+!cd /kaggle/working && CUDA_VISIBLE_DEVICES=0 nohup python lorewrite.py \
+    --ask "Who is Gurigura's master and why?" --k 6 --repetition-penalty 1.15 \
+    --model Qwen/Qwen3.5-0.8B  --out-name m08b \
+    > /kaggle/working/log-m08b.txt 2>&1 &
+!cd /kaggle/working && CUDA_VISIBLE_DEVICES=1 nohup python lorewrite.py \
+    --ask "Who is Gurigura's master and why?" --k 6 --repetition-penalty 1.15 \
+    --model Qwen/Qwen3.5-9B    --out-name m9b \
+    > /kaggle/working/log-m9b.txt 2>&1 &
+```
+
+`--out-name` is required here. Without it both processes derive the same
+filename from the same model-and-question pair and overwrite each other's
+document — the lore equivalent of two `finetune.py` runs sharing a
+`checkpoints/<run>/` directory.
+
 ### Six things that will bite you
 
 **Cell 1 does not survive a session restart.** Kaggle's pip installs are
@@ -389,10 +507,14 @@ halve the wall clock, but that is a different recipe, not a switch — see
 [Using both T4s](#using-both-t4s) for the cheap version, which is two
 concurrent experiments rather than one faster one.
 
-**Expect ~65 minutes, not 20.** 555 steps at 4096 tokens each on one T4. If
-you see ~7 s/step, look for the `causal_conv1d_fn` fallback warning from
-transformers — that kernel is the bottleneck, not the GPU. `fla` alone is only
-worth about 1.09x.
+**Expect ~65 minutes, and do not go hunting for the cause if you see ~7
+s/step.** 555 steps at 4096 tokens each on one T4 is a ~66 minute run on this
+model, and that is what it costs with the fast kernels in place. `fla` is worth
+about 1.09x; `causal_conv1d` is worth about 0.4% and usually cannot be built on
+Kaggle at all, so the `causal_conv1d_fn` fallback warning from transformers is
+expected noise rather than a diagnosis. `finetune.py` records which of the two
+were actually importable in `result.json` under `kernels`, so a slow run can be
+compared against a fast one honestly.
 
 **Kaggle mangles a `.gz` nested inside your dataset archive.** It returned a
 *directory* named `corpus-<fp>.json` where the cache file should be, so
@@ -616,8 +738,9 @@ do not fit. M4 runs on Kaggle T4.
 Two more reasons Kaggle rather than local:
 
 - Qwen3.5's layers want `flash-linear-attention`. Without it, transformers
-  prints a warning and falls back to a correct but **much slower** reference
-  implementation.
+  falls back to a correct reference implementation — measured at **1.09x**
+  slower, not the order of magnitude the fallback suggests, because the run is
+  launch-bound on the CPU either way.
 - `bitsandbytes` (needed for 4-bit QLoRA) is a CUDA extension that generally
   fails to build on Windows and generally works on Linux.
 
@@ -705,6 +828,10 @@ The things that will waste an afternoon if you don't know them.
 | `gpu_check.py` | CUDA availability check and CPU-vs-GPU benchmark |
 | `evalsets/` | The probe sets `chateval.py` scores — see its [README](evalsets/README.md) |
 | `baseline.json` | The M3 baseline, with corpus fingerprint |
+| `lorekit.py` | Loads the lore corpus into claim-sized chunks and retrieves with BM25 |
+| `loreeval.py` | Scores a generated document: citations, proper nouns, numbers |
+| `lorewrite.py` | Retrieve → prompt → generate → score, in one command |
+| `lore/` | The lore corpus and its format contract. **Gitignored** — see [lore/README.md](lore/README.md) |
 | `LOG.md` | Build log, one section per milestone |
 | `data_dirs.tmp.txt` | Template for `data_dirs.txt` |
 | `AGENTS.md` | Notes for coding agents working in this repo |
@@ -734,13 +861,42 @@ Three things it will not let you do:
 - **Read one refusal number.** It prints *refused when it should* and *answered
   when it should* separately, because a model that refuses everything scores a
   perfect refusal rate and is useless.
-- **Believe a difference smaller than `2xse`.** The chat number is reported as
-  mean ± standard error over pairs.
+- **Believe a difference smaller than `2xse`.** Both comparisons are **paired**:
+  the same items, the same rendered inputs, one process. The chat verdict uses
+  the standard error of the *difference* (`evalkit.paired_se`), and the refusal
+  verdicts use McNemar's exact test on the probes where the two models actually
+  disagreed. Both are far tighter than treating 15 pairs and 26 probes as two
+  independent samples would be — the shared part of the two models' errors
+  cancels out in a difference, and concordant refusal probes say nothing about
+  whether the models differ.
+
+An earlier version of this script got both wrong in the same direction: it
+printed the adapter's own standard error next to the base-minus-adapter
+difference, and sized the refusal rates' error bars with 26 probes when one rate
+was over 10 harmful prompts. Both mistakes made the gate unable to resolve a real
+effect. `LOG.md` records the arithmetic.
+
+And it identifies the adapter by its **weights**, not its path: `result.json`
+carries `adapter_fingerprint` with `sha256[:16]` of `adapter_model.safetensors`
+plus the producing run's `loss_after` and `kernels`. `finetune.py` is not
+bit-reproducible — a repeat of the same config moved `loss_after` by 0.00023
+nats and produced different weights — so re-running M4 overwrites
+`adapter-best/` with a different model that still calls itself `m4`. A chat-eval
+number that recorded only the path would quietly describe an adapter that no
+longer exists.
 
 **The probe sets are smoke tests, not measurements.** 15 chat pairs and 26 safety
 probes is far too few to support a claim about general ability, and the script
 says so on every run. Treat it as a tripwire that catches gross regressions, and
 grow `evalsets/` before trusting anything finer.
+
+For refusal specifically, "too few" has a precise meaning worth knowing before
+you trust a clean result: the paired exact test needs **6 discordant probes
+pointing the same way** before it reaches p ≤ 0.05, and 5 gives 0.0625. With 10
+harmful probes that means **6 of them have to flip**. Detecting a 20-point
+refusal collapse therefore needs roughly 30 harmful probes, not 10 — so today the
+gate will miss a fine-tune that erodes refusal on a third of its harmful probes.
+It catches total collapse; it does not measure erosion.
 
 Refusal detection is substring matching, which is a proxy in both directions: it
 misses refusals phrased unusually, and it will call a helpful answer a refusal if

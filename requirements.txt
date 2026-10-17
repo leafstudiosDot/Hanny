@@ -24,15 +24,21 @@ bitsandbytes==0.50.2
 
 # Optional but recommended on Kaggle:
 #   flash-linear-attention -- Qwen3.5's gated-delta-rule layers fall back to a
-#   correct but MUCH slower reference implementation without it (~7.6s/step on a
-#   GTX 1650 with the fallback). Linux wheels are more reliable than Windows.
-#   causal-conv1d is the one that actually matters here, and the old note ("same
-#   story, usually not worth the trouble") was WRONG. Without it transformers
-#   prints "`causal_conv1d_fn` is falling back to its reference PyTorch
-#   implementation" and the run stays launch-bound. CUDA extension: on Kaggle,
-#   expect a wheel or a few minutes of nvcc.
-#   Measured on a Kaggle T4: flash-linear-attention moved a 555-step run from
-#   4305s to 3960s, only 1.09x. Worth having, but not the 7x one might expect.
+#   reference implementation without it. Linux wheels are more reliable than
+#   Windows. The only one of these two kernels with a measurement behind it: a
+#   555-step T4 run went 4305s -> 3960s, so 1.09x. Worth having, but nowhere
+#   near the order of magnitude the fallback path implies.
+#
+#   causal-conv1d -- this note used to claim it was "the one that actually
+#   matters" and that the run stays launch-bound at ~7 s/step without it. Both
+#   claims were tested and are wrong. A run with fla and WITHOUT causal-conv1d
+#   finished in 3977s (7.17 s/step) against 3960s (7.14 s/step) with it: 0.4%.
+#   It is also the one that cannot be installed on Kaggle -- it builds against
+#   nvcc and the wheel build fails outright on the current image, which is the
+#   normal state of a Cell 1 run, not a broken session. transformers prints a
+#   "falling back to its reference PyTorch implementation" note; that note is
+#   noise. ~7 s/step is what this model costs on a T4. Install it only if you
+#   want to see the warning go away.
 #
 # ON KAGGLE, DO NOT `pip install -r requirements.txt`. The torch pin above
 # (2.11.0+cu128, from the cu128 extra index) would replace the CUDA-matched

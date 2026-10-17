@@ -52,3 +52,22 @@
 # evalsets/safety_probe_public.jsonl when the real file is absent. That is the
 # point: a clone gets a working eval, your machine gets the exact one.
 /evalsets/safety_probe.jsonl
+
+# The user's own lore corpus and everything generated from it. This is other
+# people's copyrighted writing -- wiki dumps, lore documents, book and game
+# texts. It has no business in this repository's history even though the
+# repository is private, because git history is forever and a clone is a copy.
+#
+# The negations at the bottom are load-bearing. `/lore/*.md` was written to
+# catch stray Markdown dropped in lore/ itself, and it also matched the two
+# files that are supposed to be tracked -- so the comment above was describing
+# an intention the rules contradicted. Check any new ignore rule with
+# `git check-ignore -v <file>` and confirm the ones you meant to keep are NOT
+# listed.
+/lore/corpus/
+/lore/prompts/
+/lore/probes/
+/lore/generated/
+/lore/*.md
+!/lore/README.md
+!/lore/_template.md
