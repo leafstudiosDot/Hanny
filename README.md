@@ -365,6 +365,60 @@ The lore corpus ships inside `hanny-data.zip`, so Cell 2 already put it in
 `/kaggle/working/lore/`. Nothing extra to upload.
 
 ```python
+# Cell 0 - restore last session's adapter.  Run this FIRST.
+#
+# /kaggle/working is wiped when the session ends, so checkpoints/ is gone every
+# time. Only two things survive it: a Dataset you uploaded by hand, or a
+# *previous notebook's saved output* attached via Input > Add Input (Kaggle:
+# "you can then reuse that data in any future Notebook"). This cell copies the
+# attached adapter back into /kaggle/working so that
+# `--adapter checkpoints/m4/adapter-best` works unchanged, and prints exactly
+# which run it is -- finetune.py is not bit-reproducible, so two adapters both
+# called 'm4' exist and only loss_after tells them apart.
+import glob, json, os, shutil
+
+WORK = "/kaggle/working"
+found = sorted(glob.glob("/kaggle/input/**/adapter_model.safetensors",
+                         recursive=True))
+print(f"adapters attached: {len(found)}")
+
+for a in found:
+    # .../<run>/adapter-best/adapter_model.safetensors
+    run = os.path.basename(os.path.dirname(os.path.dirname(a)))
+    src = os.path.dirname(os.path.dirname(a))          # the run directory
+    dst = os.path.join(WORK, "checkpoints", run)
+    if os.path.isdir(dst):
+        print(f"  {run}: already present in /kaggle/working, leaving it alone")
+        continue
+    shutil.copytree(src, dst)
+    meta = os.path.join(dst, "result.json")
+    if os.path.exists(meta):
+        j = json.load(open(meta))
+        print(f"  {run}: restored  loss_after={j.get('loss_after')}  "
+              f"kernels={j.get('kernels')}")
+    else:
+        print(f"  {run}: restored, but no result.json came with it -- so the "
+              f"provenance of these weights is unknown. Treat as suspect.")
+
+if found:
+    run = os.path.basename(os.path.dirname(os.path.dirname(found[0])))
+    print(f"\n>>> SKIP Cell 3. Use:  --adapter checkpoints/{run}/adapter-best")
+else:
+    print("\n>>> No adapter attached. Run Cell 3 to produce one (67 min).")
+    print(">>> Before you leave this session: Save output ON, then Save Version.")
+    print(">>> Next time: Input > Add Input > search for this notebook.")
+```
+
+Two things that catch people here:
+
+- **Uploading a new `hanny-data.zip` does not wipe anything.** The session ending
+  is what wipes `/kaggle/working`. Kaggle snapshots the input dataset *at session
+  start*, so a new Dataset version does not affect a running session — you need a
+  new session to pick it up.
+- **Save output must be ticked before Save Version.** Without it the notebook has
+  no output to attach, and the next session finds nothing.
+
+```python
 # Cell 5 - the retriever's instrument check
 # Run this first. It is 1 second and it tells you whether the lore corpus
 # actually unpacked and whether the probes shipped with it. If this is red,
@@ -382,6 +436,10 @@ The lore corpus ships inside `hanny-data.zip`, so Cell 2 already put it in
 # --model is the ceiling test. Change ONLY this flag to compare models on the
 # same question, same corpus, same k, same gate. Everything else identical.
 #
+# --out-name is optional but recommended: without it the document is named from
+# a hash of the model and question, which is fine for the machine and
+# unreadable for you. Set it and you know what Cell 6 produced.
+#
 # Reads /kaggle/working/lore/corpus automatically, writes the document plus a
 # .json of provenance (model, question, retrieved chunks, prompt hash) to
 # /kaggle/working/lore/generated/.
@@ -390,16 +448,85 @@ The lore corpus ships inside `hanny-data.zip`, so Cell 2 already put it in
     --k 6 \
     --max-new-tokens 900 \
     --repetition-penalty 1.15 \
-    --model Qwen/Qwen3.5-0.8B
+    --model Qwen/Qwen3.5-0.8B \
+    --out-name m08b
 ```
 
 ```python
-# Cell 7 - score a saved document on its own
-# lorewrite.py already scores what it just wrote, so this is for re-scoring an
-# older document, or one you edited by hand. Exit code 1 = the gate failed,
-# which is a result, not a crash.
-!cd /kaggle/working && python loreeval.py --doc lore/generated/<name>.md
+# Cell 7 - score every generated document
+#
+# There is no filename to fill in. lorewrite.py derives a document's name from a
+# hash of the model and the question unless you pass --out-name, so a name typed
+# by hand here is a guess -- and a guess fails with "no such document", which
+# looks like a broken script rather than a typo. This cell lists what exists and
+# says which question produced each one, then scores it.
+#
+# Exit code 1 per document = the gate failed, which is a result, not a crash.
+import glob, json, os, subprocess, sys
+
+os.chdir("/kaggle/working")
+files = sorted(glob.glob("lore/generated/*.md"))
+if not files:
+    print("no documents yet -- run Cell 6 first")
+else:
+    print(f"{len(files)} document(s) in lore/generated/\n")
+    for f in files:
+        meta = f[:-len(".md")] + ".json"
+        label = ""
+        if os.path.exists(meta):
+            j = json.load(open(meta))
+            label = f"{j.get('model', '?')}  |  {j.get('question', '?')}"
+        print("=" * 70)
+        print(f)
+        if label:
+            print(f"  {label}")
+        print("=" * 70)
+        subprocess.run([sys.executable, "loreeval.py", "--doc", f])
+        print()
 ```
+
+To re-score **one** document, name it explicitly — the name Cell 7 just printed:
+
+```python
+!cd /kaggle/working && python loreeval.py --doc lore/generated/a72de5b7.md
+```
+
+### Not re-running 67 minutes
+
+The fine-tune is 67 minutes; everything else in this notebook is seconds or two
+minutes. That asymmetry decides the whole workflow: **the adapter is the only
+artifact expensive enough to be worth persisting.**
+
+`/kaggle/working` is wiped when the session ends — 20 GB of it, and only what
+you asked to save. Two things survive it:
+
+1. **A previous notebook's output**, attached with *Input → Add Input → search
+   for a Notebook*. This is the one to use: no download, no re-upload, and
+   Kaggle indexes it alongside Datasets and Models.
+2. **A Dataset** you upload and version yourself.
+
+Enable *Save output* on **Save Version**, then attach that notebook to the next
+session. Cell 0 reports what arrived and whether to skip Cell 3.
+
+What is **not** worth persisting, because it costs nothing to recompute:
+
+| artifact | why not |
+| --- | --- |
+| retrieved chunks | BM25 over 140 claims takes **under a second** and is deterministic — re-running gains nothing |
+| the corpus | already ships inside `hanny-data.zip` |
+| the prompt | it lives in `lorewrite.py` and ships with the code |
+| `loreeval` verdicts | seconds to recompute, and they must be recomputed to be trusted |
+
+What *does* accumulate value across sessions is the **documents themselves** —
+each one with the `result.json` recording its model, question and prompt hash.
+That pair is a row in the ceiling-test comparison table, and the failing ones
+are the interesting ones: they are the cases where a bigger model can be shown
+to have helped. Keep them.
+
+One caution about persisting the adapter: `finetune.py` is not bit-reproducible,
+so a re-trained "m4" is different weights that share its name. That is why
+`chateval.py` hashes the adapter it scores, and why you should record the
+`loss_after` next to it — Cell 0 prints it for exactly this reason.
 
 **A FAIL here is the normal outcome, and the reasons are the finding.** The
 three checks are string-level and cannot tell a correct reading of a source from

@@ -349,6 +349,38 @@ def scan_for_leaks(names, tokens, allow=()):
     return problems
 
 
+# Model weights never belong in either archive.
+#
+# The leak scan cannot see them: scan_for_leaks() skips any file that raises
+# UnicodeDecodeError, and a safetensors blob always does. So an adapter built
+# from the user's private code would pass the leak check that exists precisely
+# to catch private material -- a check that passes for the wrong reason, which
+# is worse than no check.
+#
+# There is also a workflow reason. hanny-data.zip is the *input* archive: the
+# corpus, the probes, the lore. Putting a training *output* in it makes the
+# input depend on the result of training on that input, and every adapter
+# update forces a re-upload of the whole thing. Ship the adapter as its own
+# private Dataset, or attach the previous notebook's output via Input > Add
+# Input, which needs no upload at all.
+WEIGHT_SUFFIXES = (".safetensors", ".pt", ".pth", ".ckpt", ".bin")
+
+
+def find_weights(names):
+    """Every archive entry that is model weights.
+
+    `names` may be plain arcname strings (CODE_FILES is a list of paths) or
+    (arcname, abspath) pairs (DATA_GLOBS resolves to pairs), so normalise first
+    rather than assuming -- this function blew up on the first call otherwise.
+    """
+    arcs = []
+    for entry in names:
+        arc = entry[0] if isinstance(entry, (tuple, list)) else entry
+        if arc.lower().endswith(WEIGHT_SUFFIXES):
+            arcs.append(arc)
+    return arcs
+
+
 def write_archive(out_name, entries, kind):
     """Write a zip from [(arcname, abspath)], with a manifest describing it.
 
@@ -437,6 +469,24 @@ def main():
         print(f"leak scan against: {corpus_name} ({len(tokens)} path tokens)")
     else:
         print("leak scan against: (no corpus cache found -- static rules only)")
+
+    # Refuse model weights before anything is built, not after. See
+    # WEIGHT_SUFFIXES: the leak scan cannot detect them, so this has to be an
+    # explicit rule rather than something the scan happens to catch.
+    stray = find_weights(code_files) + find_weights(private_files)
+    if stray:
+        print("REFUSING TO BUILD: model weights in an archive\n")
+        for arc in stray:
+            print(f"  - {arc}")
+        print("\nA LoRA adapter is learned from your private source code. The leak")
+        print("scan reads files as text and skips anything that fails to decode, so")
+        print("it would pass weights straight through -- a check that passes for the")
+        print("wrong reason.\n")
+        print("Ship it separately instead:")
+        print("  - a private Kaggle Dataset of its own, or")
+        print("  - 'Save output' on the notebook, then Input > Add Input > the")
+        print("    notebook, which needs no upload at all.")
+        raise SystemExit(1)
 
     if not args.skip_leak_scan:
         problems = scan_for_leaks(code_files, tokens, allow)

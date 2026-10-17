@@ -43,14 +43,15 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"
 INSTRUCTION = """You are writing a reference document from the source notes below.
 
 CITATIONS -- the single most important rule.
-Every factual sentence ends with a citation copied character-for-character from
-the SOURCE FILE and HEADING of the note it came from, in this exact form:
+Each source below is labelled "CITE THIS VERBATIM" with a finished citation.
+When you use a source, copy its citation string exactly as given, character for
+character, including the double brackets and the # part.
 
-    [[corpus/path/to/file.md#the-heading-slug]]
-
-Use the full path and the full heading every time. Never write [1], [2], (see
-above), or any other shorthand. A citation that is not in that exact form cannot
-be checked and counts as no citation at all.
+Do NOT retype a path. Do NOT shorten a path. Do NOT write [1], [2], (see above),
+or anything else. Do NOT invent a heading that is not in the citation you were
+given. If you cannot find the exact string, cite the closest one verbatim
+rather than constructing your own. A citation you built by hand is wrong, and
+a citation you copied is right.
 
 OTHER RULES
 - Use ONLY the source notes. Do not add facts, names, dates or numbers that are not in them.
@@ -70,17 +71,26 @@ QUESTION
 
 
 def build_sources(chunks, limit):
-    """Render retrieved chunks with their citation target visible.
+    """Render retrieved chunks with a finished, copyable citation beside each.
 
     Deliberately NOT numbered [1], [2], ... The first generated document cited
     "[1]" and "[2]" -- it had picked up the marker style from this function
     rather than the citation format the instruction asked for. Offering the
     model two conventions and hoping it picks the checkable one is asking for
-    exactly the failure the gate exists to catch. One convention, only.
+    exactly the failure the gate exists to catch.
+
+    The citation is given in FINAL form, not as a path the model has to convert.
+    The first Kaggle run emitted
+    [[corpus/lore/corpus/evenicle-1/story.md#guru-guriaga-and-ruchofort]] --
+    a doubled 'lore/corpus' prefix and an invented, misspelled anchor -- because
+    it was handed 'lore/corpus/evenicle-1/story.md' and told to write
+    'corpus/<file>'. It had to do a string operation, and it did it wrongly.
+    There is no string operation to get wrong now.
     """
     parts = []
     for c in chunks:
-        parts.append(f"SOURCE FILE {c['rel']}\nHEADING {c['heading']}\n"
+        parts.append(f"CITE THIS VERBATIM: {c['citation']}\n"
+                     f"HEADING: {c['heading']}\n"
                      f"TEXT\n{c['text']}")
     return "\n\n".join(parts)
 

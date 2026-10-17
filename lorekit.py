@@ -110,7 +110,20 @@ def iter_corpus_files(root=None):
     return out
 
 
-def load_chunks(root=None):
+def load_chunks(root=None, strict=True):
+    """Split the corpus into one chunk per '##' claim.
+
+    `strict` decides what happens when a file yields no chunks at all. It is on
+    by default, and it is there because of a bug this function shipped for an
+    hour: a variable was renamed mid-function, every '##' heading produced a
+    chunk that was then dropped on the floor, and the function returned an empty
+    list -- no exception, no warning. The caller carried on, printed
+    'corpus: 6 files, 0 claims', and reported recall@3 = 0.00 as though that
+    were a measurement of the retriever.
+
+    A parser that finds nothing is almost always broken rather than being told
+    about a corpus that genuinely has no '##' headings. Make that loud.
+    """
     """Split the corpus into one chunk per '##' claim.
 
     Returns a list of dicts, sorted by (file, index) so the order is stable
@@ -130,6 +143,7 @@ def load_chunks(root=None):
       tokens  tokenize(text)
     """
     chunks = []
+    barren = []
     for path in iter_corpus_files(root):
         with open(path, encoding="utf-8") as f:
             raw = f.read()
@@ -139,6 +153,7 @@ def load_chunks(root=None):
         raw = re.sub(r"<!--.*?-->", "", raw, flags=re.DOTALL)
         lines = raw.splitlines()
         cur = None
+        before = len(chunks)
         for line in lines:
             m = _HEADING_RE.match(line)
             if m:
@@ -152,12 +167,69 @@ def load_chunks(root=None):
             cur["body_lines"].append(line)
         if cur:
             chunks.append(cur)
+        if len(chunks) == before:
+            barren.append(rel)
+
+    if not chunks:
+        files = len(iter_corpus_files(root))
+        msg = (f"load_chunks() found 0 claims in {files} file(s) under "
+               f"{root or CORPUS_DIR!r}.")
+        if strict:
+            raise ValueError(
+                msg + "\nEvery corpus file must use '## ' headings -- one heading "
+                "per claim (see lore/README.md).\n"
+                "This also fires when the parser itself is broken, which is the "
+                "more likely explanation. Do not return an empty list from here: "
+                "a caller will carry on and report recall 0.00 as though it were "
+                "a measurement of the retriever. Pass strict=False to override.")
+        raise ValueError(msg)
+    if barren and strict:
+        raise ValueError(
+            f"{len(barren)} corpus file(s) produced no claims: {barren}\n"
+            f"They are being read but nothing in them matches the '## ' heading "
+            f"rule, so they are invisible to retrieval. If that is deliberate, "
+            f"pass strict=False.")
 
     for i, c in enumerate(chunks):
         c["body"] = "\n".join(c["body_lines"]).strip()
         c["text"] = (c["heading"] + "\n" + c["body"]).strip()
         c["tokens"] = tokenize(c["text"])
         c["index"] = i
+        # The exact string a citation must contain, ready to copy.
+        #
+        # A chunk's `rel` is 'lore/corpus/<work>/<file>.md' because that is the
+        # path on disk, but a citation is written 'corpus/<work>/<file>.md' --
+        # citations are resolved against HERE/lore, not HERE. Handing the model
+        # `rel` and telling it to strip the leading 'lore/' works right up
+        # until the model forgets, and then it emits
+        # [[corpus/lore/corpus/evenicle-1/story.md#...]] and the citation does
+        # not resolve. The first Kaggle run did exactly that. So the finished
+        # citation is computed here, once, and the model is asked to copy it.
+        #
+        # `c["rel"]`, NOT the loop variable `rel`. `rel` belongs to the file
+        # loop above and still holds the LAST file's path when this loop runs,
+        # so using it stamped every chunk in the corpus with the same citation
+        # path -- 125 of 140 pointing at world-of-eve.md. A citation is a
+        # function of the chunk, never of where the chunk sits in a loop.
+        c["cite"] = c["rel"][len("lore/"):] if c["rel"].startswith("lore/") else c["rel"]
+        c["citation"] = f"[[{c['cite']}#{c['anchor']}]]"
+
+    # Self-check. A chunk whose citation does not derive from its own path is
+    # broken in the one way that is invisible downstream: retrieval still works,
+    # the document still reads fine, and the gate simply reports "file does not
+    # exist" for citations that look perfect. That bug shipped once already
+    # (every chunk cited world-of-eve.md, from a loop variable holding the last
+    # file's path), so it is asserted here rather than trusted.
+    broken = [c["citation"] for c in chunks
+              if c["cite"] not in c["rel"]
+              or c["anchor"] != slugify(c["heading"])]
+    if broken:
+        raise AssertionError(
+            f"{len(broken)} chunk(s) have a citation that does not match their "
+            f"own file and heading. First: {broken[0]!r}\n"
+            f"A citation is computed from c['rel'] and c['heading'] only. If a "
+            f"loop variable leaks in here, every citation in the corpus silently "
+            f"points at one file.")
     return chunks
 
 
