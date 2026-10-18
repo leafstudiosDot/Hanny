@@ -153,11 +153,30 @@ def numbers_in(text):
     return found
 
 
+# A resolvable corpus citation, matched whole. Loose-reference detection has to
+# skip these FIRST: the original pattern matched the inner [...] of a [[...]],
+# so every citation that resolved was ALSO reported as an uncheckable
+# "bracketed reference" -- the first Kaggle run to pass printed
+#     citations   1/1 resolve
+#     1 bracketed reference(s) that are not corpus citations: [...the one that resolved...]
+# which is a report contradicting itself on the same line.
+_CITATION_SPAN_RE = re.compile(r"\[\[corpus/[^\]]+\]\]")
+
 # Any bracketed marker that is NOT a corpus citation -- [1], [2], (see above).
 # Counted separately because "the model cited nothing" and "the model cited in
 # a format that does not resolve" are different failures with different fixes,
 # and reporting them as the same thing sends you looking in the wrong place.
 _LOOSE_CITE_RE = re.compile(r"(?<!\!)\[([^\]\[]+)\]")
+
+
+def loose_refs(text):
+    """Bracketed references that are not corpus citations.
+
+    Corpus citations are blanked before the scan, so a resolved citation is
+    never double-counted as an uncheckable one.
+    """
+    body = _CITATION_SPAN_RE.sub("  ", prose_only(text))
+    return [m.group(1).strip() for m in _LOOSE_CITE_RE.finditer(body)]
 
 
 def check_citations(doc, corpus_root=None):
@@ -171,7 +190,7 @@ def check_citations(doc, corpus_root=None):
     corpus_root = corpus_root or lorekit.CORPUS_DIR
     base = os.path.join(HERE, "lore")  # citations are written corpus/...
     refs = lorekit.citations_in(doc)
-    loose = [m.group(1).strip() for m in _LOOSE_CITE_RE.finditer(prose_only(doc))]
+    loose = loose_refs(doc)
     rows, resolved, broken = [], 0, []
     for raw, rel, anchor in refs:
         path = os.path.join(base, rel.replace("/", os.sep))

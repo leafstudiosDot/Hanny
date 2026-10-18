@@ -491,6 +491,105 @@ To re-score **one** document, name it explicitly — the name Cell 7 just printe
 !cd /kaggle/working && python loreeval.py --doc lore/generated/a72de5b7.md
 ```
 
+```python
+# Cell 8 - collect everything worth keeping into ONE file
+#
+# Run this last, before you end the session. It bundles the two things that
+# cannot be recomputed cheaply -- the adapter (67 minutes to rebuild) and the
+# generated documents with their provenance (the ceiling-test record) -- into a
+# single zip you can download in one click.
+#
+# It prints exactly what went in and how big it is, because "I downloaded the
+# output folder and it was missing the adapter" is a much worse afternoon than
+# reading a list before you close the browser.
+import os, zipfile, glob
+
+WORK = "/kaggle/working"
+OUT = os.path.join(WORK, "artifacts.zip")
+
+# Patterns are relative to WORK and include the folder once. An earlier version
+# stored (folder, pattern) pairs where the pattern ALSO began with the folder,
+# and joined both -- producing /kaggle/working/checkpoints/checkpoints/... and
+# an empty zip that reported itself as a success. Keep one form, not both.
+PATTERNS = [
+    "checkpoints/*/adapter-best/*",
+    "checkpoints/*/*.json",
+    "checkpoints/*/*.csv",
+    "lore/generated/*",
+]
+
+with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
+    for pat in PATTERNS:
+        for p in sorted(glob.glob(os.path.join(WORK, pat))):
+            arc = os.path.relpath(p, WORK).replace("\\", "/")
+            z.write(p, arc)
+            print(f"  + {arc}")
+
+with zipfile.ZipFile(OUT) as z:
+    names = z.namelist()
+size = os.path.getsize(OUT)
+print(f"\n{len(names)} file(s), {size:,} bytes -> artifacts.zip")
+
+if not any("adapter_model.safetensors" in n for n in names):
+    print("\n*** NO ADAPTER IN THE BUNDLE.")
+    print("*** You skipped Cell 3, or it failed. Everything else here is still")
+    print("*** worth keeping, but the next session will have to retrain.")
+else:
+    print("\nAdapter included. Unzip locally into your repo root and Cell 0's")
+    print("path (checkpoints/<run>/adapter-best) works unchanged.")
+
+try:
+    from IPython.display import FileLink
+    print("\nDownload:", FileLink(OUT))
+except Exception:
+    print(f"\nDownload from the Output pane after saving: {OUT}")
+```
+
+**Cell 8 must be the last cell you run.** It bundles whatever is in
+`/kaggle/working` at that moment, so running Cell 3 afterwards would produce a
+bundle with no adapter in it.
+
+### If the saved-version route is not working for you
+
+Save & Run All re-runs the whole notebook from a clean session, which means it
+retrains for 67 minutes — and Cell 0 still reports `adapters attached: 0`,
+because Cell 0 runs *before* Cell 3 and there was nothing attached to that fresh
+session in the first place.
+
+**Do not use `Expand-Archive -Force` for this.** It will silently swap one set
+of weights for another. This repo can hold two adapters both called `m4` —
+`finetune.py` is not bit-reproducible, and re-running overwrites the folder
+without asking — so `-Force` destroys the record of which run produced which
+weights, and `chateval.py` will later hash whichever survived.
+
+```powershell
+.venv\Scripts\python.exe pack.py --restore artifacts.zip
+```
+
+That refuses to overwrite anything that already exists, prints the provenance of
+whatever it restores, and gives you the ready-to-paste `--adapter` path:
+
+```
+provenance of what was restored:
+  kaggle-m4    loss_after=1.325564  seconds=3936.6
+               kernels={'flash_linear_attention': '0.5.2', 'causal_conv1d': False}
+               use: --adapter checkpoints/kaggle-m4/adapter-best
+```
+
+It also rejects a zip carrying anything outside `checkpoints/` and
+`lore/generated/`. Your lore corpus is hand-edited and must never be
+overwritten from an import.
+
+If a collision is what you want — you know the new weights are the ones to keep:
+
+```powershell
+.venv\Scripts\python.exe pack.py --restore artifacts.zip --force
+```
+
+An adapter that arrives without its `result.json` is restored but flagged:
+usable, but its provenance is unknown, and an unknown-provenance adapter is not
+evidence of anything.
+
 ### Not re-running 67 minutes
 
 The fine-tune is 67 minutes; everything else in this notebook is seconds or two

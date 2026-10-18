@@ -435,6 +435,93 @@ def verify_built(out, kind, tokens, allow=()):
     return problems
 
 
+def restore_artifacts(zip_path, force=False):
+    """Unpack a Kaggle artifacts.zip into the repo, refusing silent collisions.
+
+    `Expand-Archive -Force` is the obvious way to do this and the wrong one. This
+    repo can hold two adapters both called 'm4' -- finetune.py is not
+    bit-reproducible, and re-running overwrites the folder without asking -- so
+    -Force would swap one set of weights for another with no record of which is
+    which, and chateval.py would later hash whichever survived.
+
+    So: refuse to overwrite by default, and always report the provenance
+    (loss_after, kernels) of whatever was restored. An adapter that arrives
+    without its result.json is restored but flagged, because its provenance is
+    then unknown and an unknown-provenance adapter is not evidence of anything.
+    """
+    import zipfile
+
+    if not os.path.isfile(zip_path):
+        raise SystemExit(f"no such file: {zip_path}")
+
+    with zipfile.ZipFile(zip_path) as z:
+        names = [n for n in z.namelist() if not n.endswith("/")]
+        # Only these prefixes are ever restored. A zip that carries lore/corpus
+        # would overwrite the local corpus with whatever was in the session, and
+        # the corpus is hand-edited -- that must never happen from an import.
+        ok_prefixes = ("checkpoints/", "lore/generated/")
+        rejected = [n for n in names
+                    if not n.startswith(ok_prefixes)]
+        if rejected:
+            print(f"refusing {len(rejected)} entr(y/ies) outside "
+                  f"checkpoints/ and lore/generated/:")
+            for n in rejected[:10]:
+                print(f"  - {n}")
+            print("An artifacts.zip should only ever carry a training run and the "
+                  "documents it produced.\nIf that is wrong, unpack it by hand "
+                  "and look at what you are overwriting.")
+            raise SystemExit(1)
+
+        targets = [os.path.join(HERE, n.replace("/", os.sep)) for n in names]
+        clashes = [os.path.relpath(t, HERE).replace("\\", "/")
+                   for t in targets if os.path.exists(t)]
+        if clashes and not force:
+            print(f"refusing to overwrite {len(clashes)} existing file(s):")
+            for c in clashes[:10]:
+                print(f"  - {c}")
+            print("\nTwo adapters can share the name 'm4'. Overwriting one with "
+                  "the other\ndestroys the record of which run produced which "
+                  "weights.\n\n"
+                  "Move the old one aside first, or re-run with --force if you "
+                  "are certain:")
+            print(f"  .venv\\Scripts\\python.exe pack.py --restore {zip_path} --force")
+            raise SystemExit(1)
+        if clashes:
+            print(f"--force: overwriting {len(clashes)} existing file(s)\n")
+
+        print(f"{os.path.basename(zip_path)}: {len(names)} file(s)\n")
+        for n in sorted(names):
+            print(f"  + {n}")
+        z.extractall(HERE)
+
+    # Report provenance of every restored run, because that is the only thing
+    # that distinguishes two adapters with the same folder name.
+    runs = sorted({n.split("/")[1] for n in names
+                   if n.startswith("checkpoints/") and n.count("/") >= 2})
+    if not runs:
+        print("\nno checkpoints in the bundle -- nothing to report")
+        return
+    print("\nprovenance of what was restored:")
+    for run in runs:
+        meta = os.path.join(HERE, "checkpoints", run, "result.json")
+        if os.path.exists(meta):
+            try:
+                with open(meta, encoding="utf-8") as f:
+                    j = json.load(f)
+                print(f"  {run:<12} loss_after={j.get('loss_after')}  "
+                      f"seconds={j.get('seconds')}  "
+                      f"kernels={j.get('kernels', 'not recorded')}")
+                print(f"  {'':<12} use: --adapter checkpoints/{run}/adapter-best")
+            except (OSError, ValueError) as e:
+                print(f"  {run:<12} result.json unreadable ({e}) -- treat as "
+                      f"suspect")
+        else:
+            print(f"  {run:<12} NO result.json -- these weights have no "
+                  f"recorded provenance.")
+            print(f"  {'':<12} usable, but chateval.py should hash them before "
+                  f"any number is quoted.")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--which", choices=["code", "data", "both"], default="both")
@@ -447,7 +534,17 @@ def main():
                    help="accept one flagged string as deliberate. Repeatable. "
                         "Use for legitimate attribution such as a copyright "
                         "line; do not use it to silence a real corpus leak.")
+    p.add_argument("--restore", metavar="ZIP",
+                   help="unpack a Kaggle artifacts.zip (checkpoints + generated "
+                        "documents) into the repo, refusing to overwrite "
+                        "existing files. See restore_artifacts().")
+    p.add_argument("--force", action="store_true",
+                   help="with --restore, overwrite files that already exist")
     args = p.parse_args()
+
+    if args.restore:
+        restore_artifacts(args.restore, force=args.force)
+        return 0
 
     local_allow, reasons = load_local_allow()
     allow = sorted({a.lower() for a in (list(args.allow) + local_allow)})
