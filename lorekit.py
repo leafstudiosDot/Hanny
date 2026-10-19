@@ -123,8 +123,6 @@ def load_chunks(root=None, strict=True):
 
     A parser that finds nothing is almost always broken rather than being told
     about a corpus that genuinely has no '##' headings. Make that loud.
-    """
-    """Split the corpus into one chunk per '##' claim.
 
     Returns a list of dicts, sorted by (file, index) so the order is stable
     across machines and across runs -- a corpus that reorders itself between two

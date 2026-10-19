@@ -104,12 +104,20 @@ def strip_source_headers(text):
 
 
 def proper_nouns(text):
-    """Capitalised tokens that are not sentence-initial and not stopwords.
+    """Capitalised tokens that are not stopwords, wherever they sit -- the
+    sentence-initial token is INCLUDED (2026-10-19).
 
-    Sentence-initial words are skipped because "The shelf broke" would otherwise
-    report 'The' and 'Shelf' from the same line. This over-reports rather than
-    under-reports on purpose: a missed invented name is the failure this whole
-    project exists to catch, and a false positive costs a reader five seconds.
+    The old version skipped the first word of every sentence because "The shelf
+    broke" would otherwise report 'The' and 'Shelf' from the same line. But the
+    corpus-membership check in check_against_corpus() already absorbs that
+    false positive: a capitalised word present anywhere in the corpus, in any
+    casing, scores as in corpus. What the skip actually bought was hiding the
+    failure mode this check exists to catch: an invented name is most often
+    the subject that OPENS a sentence,
+    and first words were never consulted. Including them shifts the residual
+    false positives to sentence-starters genuinely absent from the corpus --
+    the same flag the same word earns mid-sentence, and a false positive costs
+    a reader five seconds while a missed invented name is the whole project.
 
     The trailing-character rule matters. The first version used
     ``[A-Za-z][A-Za-z'\\-]*``, which captures the *hyphen and stops* at the next
@@ -124,13 +132,14 @@ def proper_nouns(text):
         s = line.strip()
         if not s:
             continue
-        # Split into sentences, then drop the first word of each: that is the
-        # one capitalised by position rather than by being a name.
+        # Every word is checked, the first included -- see the docstring. The
+        # pattern had dropped the first word of each sentence because "The
+        # shelf broke" reports 'The' and 'Shelf' from the same line; the
+        # corpus membership check absorbs that false positive, so keeping the
+        # first word closes the invented-name-at-sentence-start hole.
         for sentence in re.split(r"(?<=[.!?])\s+", s):
             words = re.findall(r"[A-Za-z][A-Za-z'’-]*[A-Za-z]", sentence)
-            for i, w in enumerate(words):
-                if i == 0:
-                    continue
+            for w in words:
                 if not w[0].isupper():
                     continue
                 lw = w.lower()

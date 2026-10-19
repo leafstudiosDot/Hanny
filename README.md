@@ -50,7 +50,8 @@ is otherwise silent.
 
 ## What to do right now
 
-Three steps, in order. Total about six minutes.
+Six steps, in order. Steps 0-4 take about ten minutes on this machine (steps 3
+and 4 are most of it); step 5 is the 80-minute Kaggle fine-tune.
 
 ### Step 0 — confirm the GPU (2 seconds)
 
@@ -365,48 +366,66 @@ The lore corpus ships inside `hanny-data.zip`, so Cell 2 already put it in
 `/kaggle/working/lore/`. Nothing extra to upload.
 
 ```python
-# Cell 0 - restore last session's adapter.  Run this FIRST.
+# Cell 0 - restore or train.  This REPLACES Cell 3; you do not run Cell 3 at all.
 #
 # /kaggle/working is wiped when the session ends, so checkpoints/ is gone every
 # time. Only two things survive it: a Dataset you uploaded by hand, or a
 # *previous notebook's saved output* attached via Input > Add Input (Kaggle:
-# "you can then reuse that data in any future Notebook"). This cell copies the
-# attached adapter back into /kaggle/working so that
-# `--adapter checkpoints/m4/adapter-best` works unchanged, and prints exactly
-# which run it is -- finetune.py is not bit-reproducible, so two adapters both
-# called 'm4' exist and only loss_after tells them apart.
-import glob, json, os, shutil
+# "you can then reuse that data in any future Notebook").
+#
+# So this cell decides for itself:
+#   an adapter attached  -> restore it, do not train      (saves 67 minutes)
+#   no adapter attached  -> train one                     (the 67-minute run)
+#
+# There is no flag to set and no cell to comment out. Commenting Cell 3 is how
+# you end up with a notebook that silently skips training forever and an empty
+# checkpoints/, which looks like a broken upload.
+import glob, json, os, shutil, subprocess, sys
 
 WORK = "/kaggle/working"
-found = sorted(glob.glob("/kaggle/input/**/adapter_model.safetensors",
-                         recursive=True))
-print(f"adapters attached: {len(found)}")
+os.chdir(WORK)
 
-for a in found:
-    # .../<run>/adapter-best/adapter_model.safetensors
+# 1. Anything already in this session wins -- do not clobber it.
+present = sorted(glob.glob(os.path.join(WORK, "checkpoints", "*",
+                                        "adapter-best", "adapter_model.safetensors")))
+
+# 2. Otherwise pull one out of the attached inputs.
+attached = sorted(glob.glob("/kaggle/input/**/adapter_model.safetensors",
+                            recursive=True))
+for a in attached:
     run = os.path.basename(os.path.dirname(os.path.dirname(a)))
-    src = os.path.dirname(os.path.dirname(a))          # the run directory
+    src = os.path.dirname(os.path.dirname(a))
     dst = os.path.join(WORK, "checkpoints", run)
-    if os.path.isdir(dst):
-        print(f"  {run}: already present in /kaggle/working, leaving it alone")
-        continue
-    shutil.copytree(src, dst)
-    meta = os.path.join(dst, "result.json")
+    if not os.path.isdir(dst):
+        shutil.copytree(src, dst)
+        print(f"restored {run} from attached output")
+
+present = sorted(glob.glob(os.path.join(WORK, "checkpoints", "*",
+                                        "adapter-best", "adapter_model.safetensors")))
+
+for p in present:
+    run = p.split(os.sep)[-3]
+    meta = os.path.join(WORK, "checkpoints", run, "result.json")
     if os.path.exists(meta):
         j = json.load(open(meta))
-        print(f"  {run}: restored  loss_after={j.get('loss_after')}  "
-              f"kernels={j.get('kernels')}")
+        print(f"  {run:<22} loss_after={j.get('loss_after')}  "
+              f"seconds={j.get('seconds')}  kernels={j.get('kernels')}")
+        print(f"  {'':<22} --adapter checkpoints/{run}/adapter-best")
     else:
-        print(f"  {run}: restored, but no result.json came with it -- so the "
-              f"provenance of these weights is unknown. Treat as suspect.")
+        print(f"  {run:<22} NO result.json -- provenance unknown, treat as suspect")
 
-if found:
-    run = os.path.basename(os.path.dirname(os.path.dirname(found[0])))
-    print(f"\n>>> SKIP Cell 3. Use:  --adapter checkpoints/{run}/adapter-best")
+if present:
+    print("\n>>> adapter available, SKIPPING the 67-minute fine-tune.")
 else:
-    print("\n>>> No adapter attached. Run Cell 3 to produce one (67 min).")
-    print(">>> Before you leave this session: Save output ON, then Save Version.")
-    print(">>> Next time: Input > Add Input > search for this notebook.")
+    print("\n>>> no adapter anywhere, training one now (about 67 minutes)")
+    r = subprocess.run([sys.executable, "finetune.py",
+                        "--run", "m4", "--epochs", "3", "--batch", "8",
+                        "--eval-batch", "8", "--corpus-cache", "upload"])
+    if r.returncode != 0:
+        raise SystemExit(f"finetune.py failed with exit code {r.returncode}")
+
+# Before you leave the session: Save output ON, then Save Version.
+# Next time: Input > Add Input > this notebook.
 ```
 
 Two things that catch people here:
@@ -490,6 +509,60 @@ To re-score **one** document, name it explicitly — the name Cell 7 just printe
 ```python
 !cd /kaggle/working && python loreeval.py --doc lore/generated/a72de5b7.md
 ```
+
+### Cell 6b — the ceiling sweep
+
+Cell 6 is for one document. This is the experiment: **three models, three
+documents each.** Paste it once and leave it running.
+
+Three per model is not padding. At `--repetition-penalty 1.15` the generation is
+sampled, and 0.8B produced documents of 1371, 432 and 121 characters from
+identical settings — an 11x spread. One document per model would be an anecdote
+about a temperature, not a comparison of models.
+
+```python
+# Cell 6b - the ceiling sweep.  ~15-25 min, plus model downloads.
+#
+# One variable changes across the whole loop: --model. Same question, same k,
+# same gate, same corpus.
+#
+# 4-bit is not optional here. Qwen3.5-9B in fp16 is ~18 GB and a T4 has 15 GB;
+# in 4-bit it is ~5.5 GB. lorewrite.py defaults to 4-bit for exactly this.
+#
+# --no-score skips the per-document gate so the log stays readable. exit=0 below
+# means "did not crash", NOT "passed" -- the real verdicts come from Cell 7.
+import subprocess, sys, time
+
+MODELS = ["Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B"]
+RUNS = 3
+ASK = "Who is Gurigura's master and why?"
+
+for m in MODELS:
+    tag = m.rsplit("/", 1)[-1].replace("Qwen3.5-", "").replace("-", "")
+    for r in range(1, RUNS + 1):
+        name = f"{tag}-{r}"
+        print(f"\n{'=' * 64}\n{name}   {m}\n{'=' * 64}", flush=True)
+        t0 = time.time()
+        rc = subprocess.run([sys.executable, "lorewrite.py",
+                             "--ask", ASK,
+                             "--k", "6",
+                             "--max-new-tokens", "900",
+                             "--repetition-penalty", "1.15",
+                             "--model", m,
+                             "--out-name", name,
+                             "--no-score"]).returncode
+        print(f"  exit={rc}  {time.time() - t0:.0f}s", flush=True)
+        if rc != 0:
+            print(f"  {name} FAILED -- continuing with the rest", flush=True)
+print("\nsweep done. Run Cell 7 to score every document.")
+```
+
+`exit=0` means it did not crash. A model can generate a fluent lie and still
+exit 0 — 0.8B did exactly that, and the gate passed it. **Cell 7 is where the
+result is.**
+
+If a model name is wrong, or 9B will not fit, the loop keeps going and you get
+partial results rather than nothing.
 
 ```python
 # Cell 8 - collect everything worth keeping into ONE file
@@ -715,7 +788,7 @@ filename from the same model-and-question pair and overwrite each other's
 document — the lore equivalent of two `finetune.py` runs sharing a
 `checkpoints/<run>/` directory.
 
-### Six things that will bite you
+### Nine things that will bite you
 
 **Cell 1 does not survive a session restart.** Kaggle's pip installs are
 per-session. Start a fresh session for a new Dataset — as you must when the

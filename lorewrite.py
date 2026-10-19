@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -105,13 +106,83 @@ def load_model(model_name, precision):
     if precision == "fp16":
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16)
     else:
+        # Same quantiser as finetune.py and chateval.py, same flags. This used
+        # to say bnb_use_double_quant -- a kwarg BitsAndBytesConfig does not
+        # have, so it was silently dropped and lorewrite's base model ran
+        # without double quantisation while the other two tools had it on.
         bnb = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16, bnb_use_double_quant=True)
+            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
         model = AutoModelForCausalLM.from_pretrained(
             model_name, quantization_config=bnb, dtype=torch.float16)
     model.eval()
     return model, tok
+
+
+# Qwen3.5 is a thinking family: its chat template turns the reasoner on by
+# default, and the first ceiling sweep did not know that. All six 4B/9B runs
+# spent the whole --max-new-tokens budget on the reasoning trace and hit the
+# cap before writing a single line of document -- six "generated N chars", six
+# `exit=0`, and not one document among them. 2B escaped only because it
+# happened not to think on two of its three runs.
+#
+# Two defences, both here rather than in evalkit.py, because generate_greedy's
+# template call backs the safety measurement in chateval.py and that file stays
+# frozen:
+#   1. enable_thinking=False on the template call -- the hard switch the Qwen
+#      template documents. A tokenizer whose template does not implement the
+#      flag silently ignores it, which costs nothing for a model that does not
+#      have the reasoner at all.
+#   2. cut_think() strips a leftover reasoning block at </think> and returns how
+#      many characters it removed, so meta can say "the switch was ignored"
+#      instead of leaving a trace to be read as a document.
+
+def _template_ids_nothink(tok, messages):
+    """evalkit._template_ids with one behavioural difference: thinking off.
+
+    The shape-normalisation repeats the shared copy on purpose: _template_ids
+    takes no extra kwargs and evalkit.py is frozen, so this pipeline carries
+    the one kwarg it needs locally. Pin this copy next to it -- if the two ever
+    disagree about shapes, they will disagree loudly here and now, which is the
+    right place.
+    """
+    out = tok.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True,
+        enable_thinking=False)
+    if hasattr(out, "input_ids"):      # BatchEncoding
+        out = out["input_ids"]
+    if hasattr(out, "tolist"):         # tensor
+        out = out.tolist()
+    while isinstance(out, list) and len(out) == 1 and isinstance(out[0], list):
+        out = out[0]                   # unwrap the batch dimension
+    if not isinstance(out, list) or not all(isinstance(t, int) for t in out):
+        raise TypeError(
+            "apply_chat_template did not return a flat token-id list; refusing "
+            "to guess (same rule as evalkit._template_ids).")
+    return out
+
+
+_THINK_CLOSE = "</think>"
+_TRAILING_SPECIAL_RE = re.compile(r"(?:\s*<\|[A-Za-z0-9_.\-]{1,40}\|>)+\s*$")
+
+
+def cut_think(text):
+    """Cut a leaked reasoning block at </think>; return (document, chars_cut).
+
+    With enable_thinking honoured there is no </think> and this returns the text
+    unchanged with 0 -- the common case. With the flag ignored and the trace
+    inside the budget, it recovers the document and the non-zero count records
+    in meta that the switch was ignored. With the trace consuming the whole
+    budget there is no 发现</think> at all and the document stays the trace it is, for
+    the gate and a human read to see.
+    """
+    removed = 0
+    if _THINK_CLOSE in text:
+        head, tail = text.split(_THINK_CLOSE, 1)
+        removed = len(head) + len(_THINK_CLOSE)
+        text = tail.lstrip()
+    text = _TRAILING_SPECIAL_RE.sub("", text).strip()
+    return text, removed
 
 
 def main():

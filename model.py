@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import data
+import evalkit
 import utf8console
 
 # A legacy Windows console codepage cannot print the U+FFFD "unknown" character,
@@ -200,6 +201,21 @@ def eval_windows(d):
 
 TRAIN_EVAL_X, TRAIN_EVAL_Y = eval_windows(train_data)
 VAL_EVAL_X, VAL_EVAL_Y = eval_windows(val_data)
+
+# How much of each split the fixed eval actually scores, computed by
+# evalkit.window_geometry() so the number is derived the same way as
+# baseline.py's eval_coverage. On this corpus 256 windows x 128 characters is
+# ~1% of train and ~15% of val: fixed and comparable across runs, but a slice,
+# not the split. The token track only surfaced its 55% when the number was
+# printed; a curve.csv reader deserves to see it too, so it is also written
+# into the checkpoint's config below.
+COV_TRAIN, _, _ = evalkit.window_geometry(len(train_data), EVAL_WINDOWS, BLOCK)
+COV_VAL, _, _ = evalkit.window_geometry(len(val_data), EVAL_WINDOWS, BLOCK)
+print(f"fixed eval: {EVAL_WINDOWS} windows x {BLOCK} chars | covering "
+      f"{COV_TRAIN * 100:.1f}% of train, {COV_VAL * 100:.1f}% of val")
+config["eval_windows"] = EVAL_WINDOWS
+config["eval_coverage_train"] = round(COV_TRAIN, 3)
+config["eval_coverage_val"] = round(COV_VAL, 3)
 
 
 @torch.no_grad()

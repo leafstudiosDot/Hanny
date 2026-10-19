@@ -1,6 +1,12 @@
 numpy
-matplotlib
-tensorboard
+
+# matplotlib and tensorboard used to sit here. Nothing imports either anymore
+# (both date from the era when curves were plotted rather than written to
+# curve.csv). Commented out so a fresh install stays minimal. If you reinstall
+# matplotlib, README Gotchas item 6 documents exactly how its ABI failure
+# presents -- a circular import inside matplotlib itself.
+# matplotlib
+# tensorboard
 --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.11.0+cu128
 

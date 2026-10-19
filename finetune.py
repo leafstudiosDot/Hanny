@@ -78,9 +78,18 @@ np.random.seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cpu":
     raise SystemExit("M4 needs a GPU. Use Kaggle.")
+# The recipe trains fp16 master weights with plain AdamW -- no autocast, no
+# GradScaler. That is deliberate and verified for THIS model (loss_before was
+# bit-identical across re-runs and the M4 drop was 4.96x its own standard
+# error), not a property of the hardware: small fp16 gradients can underflow,
+# so if the model or lr is replaced, re-verify rather than assume it carries
+# over. A GradScaler is the conventional belt-and-braces if this ever proves
+# unstable.
 if torch.cuda.get_device_capability(0)[0] < 8:
     print(f"note: compute capability {torch.cuda.get_device_capability(0)} is Turing -- "
           f"no bf16, using fp16. This is correct for both GTX 1650 and T4.")
+    print("      fp16 master weights + plain AdamW, no GradScaler -- tested stable "
+          "on this model; re-verify if model or lr changes.")
 
 OUT = os.path.join(HERE, "checkpoints", args.run)
 os.makedirs(OUT, exist_ok=True)

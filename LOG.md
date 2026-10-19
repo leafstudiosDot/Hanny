@@ -680,7 +680,7 @@ edit cannot silently reintroduce it.
 ### Known limits of this gate
 
 - 15 chat pairs and 26 safety probes. The script prints a warning on every run
-  and sets `MIN_PAIRS_FOR_CHAIM = 40`. The chat floor is now `±0.024` rather
+  and sets `MIN_PAIRS_FOR_CLAIM = 40`. The chat floor is now `±0.024` rather
   than `±0.144`, which helps, and does not change the arithmetic: 15 items is 15
   items.
 - **The safety half is far blunter than "small n" suggests, and the arithmetic
@@ -876,6 +876,97 @@ M4's verdict (+0.2697 nats, 4.9× over threshold) and the M5-gate verdict (no
 general-ability regression, no refusal collapse) both stand. The M5 gate was not
 re-measured against this newer adapter — see "Which adapter these numbers belong
 to" above.
+
+---
+
+## Fix pass — 2026-10-19
+
+A full read of the code and docs by the coding agent, with the user choosing
+between the two design forks. Nothing here re-runs a recorded experiment; the
+one change that touches a measurement (the lore gate's proper-noun check) is
+re-scored against every generated document below.
+
+### `lorewrite.py` loaded its 4-bit base with different flags than the tools it borrows numbers from
+
+`chateval.py` and `finetune.py` both pass `bnb_4bit_use_double_quant=True`.
+`lorewrite.py` said `bnb_use_double_quant=True` — not a kwarg
+`BitsAndBytesConfig` has, so it was silently dropped: the lore pipeline's base
+model ran NF4 *without* double quantisation while the two tools whose numbers
+get compared elsewhere had it on. Nothing crashed and nothing warned; the only
+symptom would have been a slightly different quantisation error. Fixed, and
+the call site now carries a comment recording why the flag is spelled the way
+it is. Found by diffing the three quantiser-load sites, not by a failure —
+which is the usual way this class of bug survives a review.
+
+### `loreeval.py` — the proper-noun check skipped the one case it exists for
+
+`proper_nouns()` dropped the first word of every sentence, ever since "The
+shelf broke" would otherwise flag 'The'. The docstring simultaneously claimed
+the check over-reports "because a missed invented name is the failure this
+whole project exists to catch" — but an invented name is most often the
+subject that OPENS a sentence, and first words were never consulted. The skip
+is removed. The corpus-membership check absorbs the false positive the skip
+guarded against: a capitalised word present anywhere in the corpus, in any
+casing, was already scored as a hit, so consulting first words costs nothing
+for corpus words. What remains flagged at sentence start is the same flag the
+same word earns mid-sentence.
+
+All five generated documents re-scored, prompts and corpus untouched:
+
+| document | names flagged before -> after | new flags | verdict |
+| --- | --- | --- | --- |
+| m08b | 0 -> 0 | -- | FAIL, unchanged (no citations) |
+| kaggle-pass | 0 -> 0 | -- | PASS, unchanged |
+| rp115 | 0 -> 0 | -- | FAIL, unchanged (bracketed cites) |
+| prompt-fixed | 1 -> 5 | Breaking, Inability, Lore (x2), Sources | FAIL, same categories |
+| 74314d6f | 0 -> 0 | -- | FAIL, unchanged (no citations) |
+
+Each new flag was read by hand: none is an invented lore name. 'Lore' and
+'Sources' are the model echoing prompt scaffolding; 'Breaking' and 'Inability'
+are ordinary words the corpus happens not to contain — the
+five-seconds-per-flag class the docstring already budgets for. No verdict
+moved, and the one PASS survived the stricter check. The change is
+prospective: the check now inspects sentence-opening names, which is where a
+model puts a name it invented. If the 'Lore'/'Sources' echoes keep appearing,
+the fix is extending `strip_source_headers()`, not reverting this.
+
+### `model.py` never reported eval coverage
+
+The token track's 55%-coverage discovery produced instrumentation
+(`evalkit.window_geometry()`, `eval_coverage` in `baseline.json`). The char
+track — 256 windows x 128 characters against a 215,664-character val split —
+scores **~15%** and printed nothing about it. It now prints coverage for both
+splits at startup and writes `eval_windows`, `eval_coverage_train` and
+`eval_coverage_val` into every checkpoint's `config`. Window *construction*
+stays local to `model.py`, deliberately: `evalkit.fixed_windows()` builds
+seq_len-sized windows for input==labels scoring, and this scorer needs the
+shifted (BLOCK+1) pair — moving the linspace end by even one token would
+invalidate every recorded curve.csv. The reporting is shared; the method is
+not.
+
+Reproducibility re-verified unchanged: two fresh `--steps 40 --eval-every 20`
+runs printed identical losses at every step (step 0: 4.765 / 4.773, step 20:
+2.984 / 3.186, step 40: 2.781 / 2.978), and step 0's val matches the README's
+expected smoke output exactly.
+
+### Doc drift, swept (the failure mode this log hunts)
+
+- README "What to do right now" said "Three steps, in order. Total about six
+  minutes" over six steps, the last of which is an 80-minute Kaggle run. Now
+  says six steps with honest timings.
+- "Six things that will bite you" was nine bullets. Retitled.
+- `MIN_PAIRS_FOR_CLAIM` was spelled `MIN_PAIRS_FOR_CHAIM` in AGENTS.md and in
+  the M5 section above — written from memory, which is exactly what the
+  reconstruction disclaimer at the top of this file promises not to do.
+  Renamed.
+- `requirements.txt` listed `matplotlib` and `tensorboard`; nothing imports
+  either anymore. Commented out with the reason and a pointer at Gotchas #6.
+- `finetune.py`'s Turing note now states the fp16 recipe in a comment and in
+  run output: fp16 master weights + plain AdamW, no autocast, no GradScaler —
+  tested stable on this model across re-runs, to be re-verified if the model
+  or lr changes, never assumed.
+- `lorekit.load_chunks()` had two consecutive docstrings; the first was dead
+  text. Merged into one.
 
 ---
 
