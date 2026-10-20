@@ -348,8 +348,15 @@ def main():
         if not args.json and not args.no_stream:
             print()
         reply, cut = qwenkit.strip_think(reply)
-        if cut and not args.json:
-            print(f"[stripped {cut} chars of reasoning trace]")
+        if not args.json:
+            if args.no_stream:
+                # --no-stream collects the reply instead of printing it during
+                # generation. Without this the answer is generated and silently
+                # dropped: a Kaggle `--ask --no-stream` cell showed the banner
+                # and the kernel warnings, then nothing.
+                print(reply)
+            if cut:
+                print(f"[stripped {cut} chars of reasoning trace]")
         if args.json:
             print(json.dumps({
                 "model": args.model, "precision": args.precision, "adapter": args.adapter,

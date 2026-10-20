@@ -184,6 +184,31 @@ Upload both zips to the same **private** Kaggle Dataset, add a new version, and
 restart the notebook session so `/kaggle/input` sees it. Notebook settings:
 **GPU T4 x2** (one card is used), **Internet on**, **Persistence: Files only**.
 
+A ready-to-import version of these cells is `hanny-notebook.ipynb` in the repo
+root (`File > Import Notebook`). It has the same version check, the same
+gate-only path, and a guard that refuses to retrain over an existing run
+unless `ALLOW_RETRAIN = True`. The cells below remain the source of truth.
+
+Cell 0 — GPU check, before the dependency install. This is the difference
+between "Kaggle gave me a GPU" and "the notebook is quietly on CPU". `sft.py`
+refuses CPU training, but the failure is clearer before a long pip step.
+
+```python
+import torch
+
+print("torch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("GPUs visible:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i))
+
+assert torch.cuda.is_available(), (
+    "No GPU visible. In Kaggle use Session options > Accelerator > GPU T4 x2, "
+    "save, restart the session, and re-run this cell. sft.py will not train on CPU.")
+print("NOTE: sft.py is single-process and trains on cuda:0 only; the second "
+      "T4 stays idle. See 'Using both T4s' below.")
+```
+
 Cell 1 — dependencies. Re-run in every new session. Do **not** install torch and
 do **not** `pip install -r requirements.txt`: it pins a cu128 torch that replaces
 Kaggle's CUDA-matched build.
@@ -206,28 +231,63 @@ Cell 2 — unpack both archives into `/kaggle/working` and verify. This searches
 `/kaggle/input` instead of hardcoding a slug.
 
 ```python
-import glob, os, subprocess, torch
+import glob, os, shutil, subprocess, torch
 
 ROOT = "/kaggle/working"
-for name in ("hanny-code.zip", "hanny-data.zip"):
-    hits = glob.glob(f"/kaggle/input/**/{name}", recursive=True)
-    if not hits:
-        print("mounted:", glob.glob("/kaggle/input/*"))
-        raise SystemExit(f"{name} not found; attach the dataset or fix the path")
-    print("unzip", hits[0])
-    subprocess.run(["unzip", "-oq", hits[0], "-d", ROOT], check=True)
+for stem in ("hanny-code", "hanny-data"):
+    zips = glob.glob(f"/kaggle/input/**/{stem}.zip", recursive=True)
+    dirs = [d for d in glob.glob(f"/kaggle/input/**/{stem}", recursive=True)
+            if os.path.isdir(d)]
+    if zips:
+        print("unzip", zips[0])
+        subprocess.run(["unzip", "-oq", zips[0], "-d", ROOT], check=True)
+    elif dirs:
+        print("copy", dirs[0])
+        for name in os.listdir(dirs[0]):
+            src, dst = os.path.join(dirs[0], name), os.path.join(ROOT, name)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+    else:
+        raise SystemExit(f"{stem}.zip or {stem}/ missing under /kaggle/input")
 
-required = ["sft.py", "chat.py", "qwenkit.py", "chateval.py",
+# Optional: a previously trained artifact bundle, for gate-only reruns.
+for art in glob.glob("/kaggle/input/**/*artifacts.zip", recursive=True):
+    print("unzip artifacts", art)
+    subprocess.run(["unzip", "-oq", art, "-d", ROOT], check=True)
+
+required = ["sft.py", "chat.py", "qwenkit.py", "chateval.py", "evalkit.py",
             "evalsets/chat_probe.jsonl"]
 missing = [r for r in required if not os.path.exists(os.path.join(ROOT, r))]
 if missing:
-    raise SystemExit(f"missing {missing}; rebuild hanny-code.zip with pack.py")
+    raise SystemExit(f"missing {missing}; wrong dataset version?")
 print("safety probes:",
       "private" if os.path.exists(f"{ROOT}/evalsets/safety_probe.jsonl")
       else "PUBLIC FALLBACK (weaker gate)")
 print("corpus:", glob.glob(f"{ROOT}/upload/corpus-*.json"))
 print("GPU:", torch.cuda.is_available(), torch.cuda.get_device_name(0),
       torch.cuda.get_device_capability(0))   # (7, 5) = T4 = no bf16
+assert torch.cuda.is_available(), "Enable GPU T4 x2 in Notebook settings"
+
+# Reject a stale dataset version before spending GPU time. These needles are the
+# fixes that came out of the first 4B run: shifted eval loss, parent-memory
+# release before the gate, a printable one-shot reply, and thinking-off scoring.
+expected = {
+    "sft.py": ["shift_logits", "empty_cache", "gate_exit", "gate_only",
+               "utf-8-sig"],
+    "chat.py": ["print(reply)"],
+    "evalkit.py": ["enable_thinking", "system=None"],
+    "chateval.py": ['"thinking": False', '"system": args.system',
+                    "utf-8-sig"],
+}
+for fn, needles in expected.items():
+    src = open(os.path.join(ROOT, fn), encoding="utf-8").read()
+    missing = [n for n in needles if n not in src]
+    if missing:
+        raise SystemExit(
+            f"{fn} is stale (missing {missing}); upload the new dataset version")
+print("code version: fixed eval + gate cleanup + chat print + thinking off")
 ```
 
 Cell 3 — pick the run. Do `0.8b` once to validate the pipeline cheaply; `4b` is
@@ -235,12 +295,16 @@ the target.
 
 ```python
 CONFIG = {
-    "0.8b": dict(model="Qwen/Qwen3.5-0.8B", run="m5",    tokens=4096, steps=800),
-    "4b":   dict(model="Qwen/Qwen3.5-4B",  run="m5-4b", tokens=2048, steps=500),
+    "0.8b": dict(model="Qwen/Qwen3.5-0.8B", run="m5",       tokens=4096, steps=800),
+    "4b":   dict(model="Qwen/Qwen3.5-4B",  run="m5-4b-v2", tokens=2048, steps=500),
 }["4b"]        # <-- change to "0.8b" for the cheap first pass
 MODEL, RUN = CONFIG["model"], CONFIG["run"]
 print(CONFIG)
 ```
+
+`m5-4b-v2` is deliberately a new run name. The earlier `m5-4b` was trained
+before the shifted-loss fix, so its held-out loss and gate are not interpretable;
+do not overwrite it, and do not quote its numbers.
 
 Cell 4 — data check, no weights and no GPU spend. 2000 per source is enough to
 see the mix and the supervised span; the training cell streams the full cap.
@@ -256,9 +320,12 @@ subprocess.run([
 ], cwd="/kaggle/working", check=True)
 ```
 
-Cell 5 — train. About 1.5 h for 0.8B, about 3 h for 4B, plus the gate. A
-non-zero `sft.py` exit is usually the gate failing, not training dying; read the
-gate output and keep the adapter either way.
+Cell 5 — train. Measured: 4B, 500 steps x 2048 tokens took 83 minutes on one T4.
+(The earlier 0.8B reference was ~64 minutes for 555 steps x 4096 tokens.)
+`sft.py` is single-process and uses `cuda:0`; the **T4 x2** setting does not
+make one run faster. Using both GPUs for one run needs DDP, which is not
+implemented. A non-zero `sft.py` exit is usually the gate failing, not training
+dying; read the gate output and keep the adapter either way.
 
 ```python
 import subprocess, time
@@ -276,6 +343,25 @@ rc = subprocess.run([
 print(f"sft.py exit={rc}  {(time.time()-t0)/60:.1f} min")
 ```
 
+Cell 5b  Egate only, no retraining. Use this after a gate failure, or after
+attaching a previously trained adapter. It runs `chateval.py` in a fresh process
+and updates `checkpoints/<run>/result.json` with the gate path and exit code.
+Skip Cell 5 when using this cell; Cell 5 would retrain and overwrite the run.
+
+```python
+import subprocess
+rc = subprocess.run([
+    "python", "sft.py", "--gate-only", "--run", RUN,
+    "--model", MODEL, "--precision", "4-bit nf4",
+], cwd="/kaggle/working").returncode
+print(f"gate-only exit={rc}")
+```
+
+If the adapter is not in `/kaggle/working`, attach `m5-4b-v2-artifacts.zip` as
+a private Kaggle Dataset and unpack it there first. Do not retrain just to rerun
+the gate; `--gate-only` exists so a measurement bug does not cost another
+2 GPU-hours.
+
 Cell 6 — one-shot chat against the adapter that just trained. Kaggle has no
 stdin, so this is `--ask`, not the REPL.
 
@@ -283,8 +369,12 @@ stdin, so this is `--ask`, not the REPL.
 !cd /kaggle/working && python chat.py --model {MODEL} \
     --adapter checkpoints/{RUN}/adapter-best \
     --ask "Explain a hash table in three sentences, then give one Python example." \
-    --max-new-tokens 160 --no-stream
+    --max-new-tokens 160 --json
 ```
+
+`--json` prints the full reply even when it is not streaming; `--no-stream`
+alone used to generate and print nothing. 160 tokens can end mid-sentence,
+which is expected, not a truncation bug.
 
 Cell 7 — read the numbers and bundle the adapter, gate and curve.
 
@@ -295,8 +385,15 @@ r = json.load(open(os.path.join(run_dir, "result.json"), encoding="utf-8-sig"))
 print(json.dumps(r, indent=2))
 gate = os.path.join(run_dir, "gate", "result.json")
 if os.path.exists(gate):
-    print("\nGATE:")
-    print(json.dumps(json.load(open(gate, encoding="utf-8-sig")), indent=2))
+    g = json.load(open(gate, encoding="utf-8-sig"))
+    # Do NOT print g["base"]["per_probe"] / g["tuned"]["per_probe"]: those
+    # contain the private safety prompts. Aggregate rates are shareable.
+    print("\nGATE (per-probe rows omitted):")
+    print(json.dumps({k: v for k, v in g.items()
+                      if k not in ("base", "tuned")}, indent=2))
+    for side in ("base", "tuned"):
+        if side in g:
+            print(side, {k: v for k, v in g[side].items() if k != "per_probe"})
 
 out = f"/kaggle/working/{RUN}-artifacts.zip"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -309,17 +406,38 @@ assert any(n.endswith("adapter_model.safetensors") for n in names), "no adapter 
 print(f"\n{len(names)} files, {os.path.getsize(out)/1e6:.1f} MB -> {out}")
 ```
 
-Download `m5-4b-artifacts.zip` from the Output pane after **Save Version**, then
-locally:
+The artifacts zip includes `gate/result.json`, whose `per_probe` rows contain
+the private safety prompts. Keep that zip private; quote only the aggregate
+rates and the paired verdicts.
+
+Download `m5-4b-v2-artifacts.zip` from the Output pane after **Save Version**,
+then locally:
 
 ```powershell
-.venv\Scripts\python.exe pack.py --restore m5-4b-artifacts.zip
-.venv\Scripts\python.exe chat.py --adapter checkpoints/m5-4b/adapter-best
+.venv\Scripts\python.exe pack.py --restore m5-4b-v2-artifacts.zip
+.venv\Scripts\python.exe chat.py --adapter checkpoints/m5-4b-v2/adapter-best
 ```
 
 `pack.py --restore` refuses to overwrite an existing run; use `--force` only
 when you mean to replace it. `result.json["gate"]` is a path, not a number; read
 the gate file, and do not quote `loss_after` as chat quality.
+
+---
+
+### Using both T4s
+
+`sft.py` and `chateval.py` are single-process. They use one GPU (`cuda:0`); the
+second T4 stays idle, and the **GPU T4 x2** setting does not make one run
+faster. Using both GPUs for one run requires Distributed Data Parallel: one
+process per GPU, a sharded batch stream, gradient all-reduce, rank-0-only
+evaluation/saving, and a gate that starts after the worker exits. That is a code
+change, not a notebook setting; it also changes the effective batch and needs a
+new `--run` name. It is not implemented.
+
+What works today: one T4 for the measured recipe, or two **independent**
+experiments in two sessions (or two subprocesses pinned with
+`CUDA_VISIBLE_DEVICES=0` and `=1`), which is two results rather than one faster
+run. The v2 gate-only rerun involves no training and is fine on one GPU.
 
 ---
 

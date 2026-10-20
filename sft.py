@@ -38,6 +38,10 @@ cap with --max-steps / --max-train-tokens.
         --from-hub HuggingFaceH4/ultrachat_200k::default::train_sft \\
         --max-per-source 40000 --max-steps 1200 --eval-every 100
 
+    # rerun only the gate against an existing adapter; no data, no training
+    .venv\\Scripts\\python.exe sft.py --gate-only --run m5-4b-v2 \\
+        --model Qwen/Qwen3.5-4B
+
 Privacy: a local file can contain your own projects or lore. `sft.py` records
 only its basename and hash, never the full path, because result.json is read by
 upload.py and may end up in a model card. Publishing any adapter or dataset
@@ -45,6 +49,7 @@ trained on private text is refused by upload.py unless you explicitly claim the
 rights.
 """
 import argparse
+import gc
 import json
 import math
 import os
@@ -530,16 +535,58 @@ def score_examples(model, examples, pad_id, max_tokens, device):
             xb, yb, am = pad_batch([examples[i] for i in b], pad_id)
             xb, yb, am = xb.to(device), yb.to(device), am.to(device)
             logits = model(input_ids=xb, attention_mask=am).logits
+            # Causal LM: logits at position t predict the token at t+1. The
+            # training path gets this shift from `labels=yb`; scoring must do
+            # it by hand. Without the shift the eval compares logits[t] with
+            # labels[t] and reports a loss worse than uniform (the 4B run read
+            # 16.3 nats where ln(vocab) is 12.4), which is not a measurement.
+            shift_logits = logits[:, :-1, :]
+            shift_labels = yb[:, 1:]
             token_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), yb.view(-1),
-                ignore_index=-100, reduction="none").view(yb.shape)
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
+                ignore_index=-100, reduction="none").reshape(shift_labels.shape)
             for row, i in enumerate(b):
-                mask = yb[row] != -100
+                mask = shift_labels[row] != -100
                 n = int(mask.sum())
                 if n:
                     out[i] = float(token_loss[row][mask].mean())
-            del logits, token_loss
+            del logits, shift_logits, shift_labels, token_loss
     return out
+
+
+def run_gate(out, model_name, precision, system=None):
+    """Run chateval.py against an existing run folder's adapter-best.
+
+    Returns (relative gate path or None, exit code). The gate is a separate
+    process by design: it loads its own 4-bit copy of the base model, and the
+    training process must have released its model first. `--gate-only` calls
+    this without training, so a failed gate does not cost another T4 run.
+
+    system must be the string the run trained with. `None` means the run was
+    trained with --no-system; chateval needs the empty flag to reproduce that,
+    not its own default prompt.
+    """
+    gate_dir = os.path.join(out, "gate")
+    cmd = [sys.executable, os.path.join(HERE, "chateval.py"),
+           "--model", model_name, "--precision", precision,
+           "--adapter", os.path.join(out, "adapter-best"),
+           "--system", system or "",
+           "--out", gate_dir]
+    print("\nrunning the M5 gate (base vs adapter, one process, same precision):")
+    print("  " + " ".join(cmd))
+    gate_exit = subprocess.call(cmd)
+    gate_path = None
+    gate_result = os.path.join(gate_dir, "result.json")
+    if gate_exit == 0 and os.path.exists(gate_result):
+        gate_path = os.path.relpath(gate_result, HERE)
+    elif gate_exit == 0:
+        print("WARNING: chateval.py exited 0 but wrote no result.json; "
+              "no gate number is quoted.")
+        gate_exit = 1
+    else:
+        print(f"WARNING: chateval.py exited {gate_exit}; no gate number is quoted.")
+    return gate_path, gate_exit
 
 
 def main():
@@ -588,10 +635,54 @@ def main():
                                           "attribution becomes ambiguous)")
     p.add_argument("--gate", action=argparse.BooleanOptionalAction, default=True,
                    help="run chateval.py on the best adapter afterwards")
+    p.add_argument("--gate-only", action="store_true",
+                   help="run only the gate against checkpoints/<run>/adapter-best; "
+                        "no data build, no training, and result.json is updated")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dry-run", action="store_true",
                    help="build and report the dataset, write nothing downstream")
     args = p.parse_args()
+
+    if args.gate_only:
+        out = os.path.join(HERE, "checkpoints", args.run)
+        adapter = os.path.join(out, "adapter-best")
+        if not os.path.isdir(adapter):
+            raise SystemExit(
+                f"{os.path.relpath(adapter, HERE)} does not exist. --gate-only "
+                "needs an already-trained run; point --run at it.")
+        result_path = os.path.join(out, "result.json")
+        result = None
+        if os.path.exists(result_path):
+            # utf-8-sig: PowerShell 5.1 writes a BOM, and a valid result.json
+            # must not read as missing. Writers stay plain UTF-8.
+            with open(result_path, encoding="utf-8-sig") as f:
+                result = json.load(f)
+            # An adapter is not portable across bases or precisions. Catch the
+            # common mistake (forgetting --model on a 4B run) before spending
+            # minutes loading the wrong weights.
+            for key, given in (("model", args.model), ("precision", args.precision)):
+                recorded = result.get(key)
+                if recorded and recorded != given:
+                    raise SystemExit(
+                        f"--gate-only {key} {given!r} does not match this run's "
+                        f"recorded {key} {recorded!r}. Pass the recorded value.")
+        if result is not None and "system" in result:
+            system = result["system"]
+        else:
+            system = qwenkit.DEFAULT_SYSTEM
+        if result is not None and "system" not in result:
+            print("note: this run predates system recording; assuming the "
+                  "default system prompt. Pass --no-system only if that is "
+                  "what it trained with.")
+        gate_path, gate_exit = run_gate(out, args.model, args.precision, system)
+        if result is not None:
+            result["system"] = system
+            result["gate"] = gate_path
+            result["gate_exit"] = gate_exit
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            print(f"updated {os.path.relpath(result_path, HERE)}")
+        return 0 if gate_exit == 0 else (gate_exit or 1)
 
     if args.thinking:
         raise SystemExit(
@@ -650,6 +741,16 @@ def main():
                             args.max_tokens_per_batch, device)
     before_mean, before_se = mean_se(before)
     print(f"BEFORE  held-out loss {before_mean:.4f} +- {before_se:.4f}")
+    # A chat model can be bad, but it cannot be worse than a uniform guess by
+    # accident on this data. A number above ln(vocab) is the signature of an
+    # eval misalignment (the first 4B run scored unshifted logits at 16.3 nats,
+    # against ln(248077)=12.4). Refuse to train on a metric that cannot be read.
+    uniform = math.log(len(tok))
+    if not math.isfinite(before_mean) or before_mean > uniform:
+        raise SystemExit(
+            f"base held-out loss {before_mean:.3f} is not below uniform "
+            f"{uniform:.3f}. The eval is misaligned or the model is not a chat "
+            "model; fix the measurement before spending GPU time on training.")
 
     targets, missing = qwenkit.lora_targets(model)
     print(f"\nLoRA targets: {targets}")
@@ -790,6 +891,7 @@ def main():
         "kind": "chat-sft",
         "chat_template_sha16": report["chat_template_sha16"],
         "thinking": False,
+        "system": report["system"],
         "sources": report["sources"],
         "data_counts": report["counts"],
         "examples": report["examples"],
@@ -816,21 +918,36 @@ def main():
     }
 
     gate_path = None
+    gate_exit = None
     if args.gate:
-        gate_dir = os.path.join(out, "gate")
-        cmd = [sys.executable, os.path.join(HERE, "chateval.py"),
-               "--model", args.model, "--precision", args.precision,
-               "--adapter", os.path.join(out, "adapter-best"),
-               "--out", gate_dir]
-        print("\nrunning the M5 gate (base vs adapter, one process, same precision):")
-        print("  " + " ".join(cmd))
-        rc = subprocess.call(cmd)
-        if rc == 0 and os.path.exists(os.path.join(gate_dir, "result.json")):
-            gate_path = os.path.relpath(os.path.join(gate_dir, "result.json"), HERE)
-        else:
-            print(f"WARNING: chateval.py exited {rc}; no gate number is quoted.")
+        # chateval.py loads its own 4-bit copy of the base model. This process
+        # still holds the training model, optimizer and last batch; on a 15 GB
+        # T4 the 4B child then OOMs while the parent holds 13.5 GB (seen on the
+        # first m5-4b run, which left gate=null). Free them before spawning it.
+        try:
+            del xb, yb, am, loss
+        except NameError:
+            pass
+        try:
+            del opt
+        except NameError:
+            pass
+        try:
+            del params
+        except NameError:
+            pass
+        try:
+            del model
+        except NameError:
+            pass
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        gate_path, gate_exit = run_gate(
+            out, args.model, args.precision, report["system"])
 
     result["gate"] = gate_path
+    result["gate_exit"] = gate_exit
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     print(f"\nwrote {os.path.relpath(out, HERE)}/result.json, curve.csv, "

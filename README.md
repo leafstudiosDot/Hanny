@@ -919,7 +919,7 @@ from peft import PeftModel
 base_id = "Qwen/Qwen3.5-4B"
 base = AutoModelForCausalLM.from_pretrained(
     base_id, dtype="float16", device_map={"": "cpu"})
-model = PeftModel.from_pretrained(base, "checkpoints/m5-4b/adapter-best")
+model = PeftModel.from_pretrained(base, "checkpoints/m5-4b-v2/adapter-best")
 model = model.merge_and_unload()
 model.save_pretrained("merged-4b", safe_serialization=True)
 AutoTokenizer.from_pretrained(base_id).save_pretrained("merged-4b")
@@ -936,7 +936,7 @@ for those. A merged model still carries the same training-data obligation; the
 
 **Testing without publishing:** `chat.py --ask "..."` is the whole loop. On
 Kaggle, a cell can run `!python chat.py --model Qwen/Qwen3.5-4B --adapter
-checkpoints/m5-4b/adapter-best --ask "..."` — one reply, then exit; the REPL
+checkpoints/m5-4b-v2/adapter-best --ask "..."` — one reply, then exit; the REPL
 does not work there because Kaggle gives no stdin. Locally it works for 0.8B,
 and for 4B only at a short context, if at all.
 
@@ -1273,6 +1273,13 @@ answers that, and it runs on the 1650 — no Kaggle needed.
 .venv\Scripts\python.exe chateval.py --adapter checkpoints/m4/adapter-best --show-probes 3
 ```
 
+It scores the same system prompt `sft.py` trains with and `chat.py` sends by
+default (`qwenkit.DEFAULT_SYSTEM`), and it forces `enable_thinking=False`.
+Both are part of the measurement, not presentation: Qwen3.5's 4B template
+defaults to an open think block, which is not prefix-stable, and a model asked
+at inference for a turn shape it never trained on is being measured on the
+wrong distribution. Pass `--system ""` only to reproduce a no-system baseline.
+
 Three things it will not let you do:
 
 - **Compare across precision.** Base and adapter are loaded and scored in the
@@ -1387,7 +1394,7 @@ supervised span before spending a GPU-hour.
 Same command, with these changes:
 
 ```powershell
-.venv\Scripts\python.exe sft.py --run m5-4b `
+.venv\Scripts\python.exe sft.py --run m5-4b-v2 `
     --model Qwen/Qwen3.5-4B `
     --from-hub allenai/tulu-3-sft-mixture `
     --from-hub HuggingFaceH4/ultrachat_200k::default::train_sft `
@@ -1396,14 +1403,19 @@ Same command, with these changes:
     --max-steps 500 --eval-every 100
 ```
 
+Use a new `--run` name when the code that measured the previous run changes.
+The first `m5-4b` run was *measured* under a shifted-loss bug in `sft.py`, so
+its recorded loss and its empty gate are not interpretable; keep the folder but
+do not quote its numbers or overwrite it. `m5-4b-v2` is the comparable run.
+
 - **`--max-tokens-per-batch 2048`, not 4096.** At 4096 tokens the logits tensor
   is ~2 GB in fp16, and the fp32 softmax workspace plus its gradient add ~6 GB
   more. That is before the 4B weights and activations. 2048 fits a 15 GB T4
   with room; 4096 is a coin flip that costs a session.
-- **500 steps at 2048 tokens is ~1M tokens, roughly 2.5–3 hours.** The 0.8B rate
-  is measured at ~2M tokens per T4-hour. Assume ~5x slower per token for 4B
-  (estimate, not measured here), so ~0.4M tokens/hour. Do not copy the 800-step
-  0.8B recipe and expect it to finish.
+- **500 steps at 2048 tokens is ~1M tokens, roughly 2.5–3 hours.** Measured instead: 500 steps at 2048 tokens took 83 minutes on one T4,
+  ending at step 500 with 873,676 train tokens seen (0.64M tokens/hour). The
+  earlier estimate of ~0.4M tokens/hour was pessimistic. Do not copy the 800-step
+  0.8B recipe and expect it to finish in the same session.
 - **9B needs `--max-tokens-per-batch 1024`** and still buys only a few hundred
   thousand tokens in a 3-hour session. Treat it as a format nudge on a stronger
   base, not an instruction-tuning run.
@@ -1420,9 +1432,32 @@ Kaggle's weekly GPU quota is commonly 30 hours (check *Session options* for the
 real number) and sessions cap at 12 hours. Both T4s do not help `sft.py` — it is
 single-process like `finetune.py` — so use one card, or run two experiments.
 
-**Status: harness built, no real M5 run yet.** Nothing here has trained on the
-instruction mixture, so there is no chat-quality number to report. Do not read
-`sft.py --dry-run` as a result.
+**Status: the first 4B chat-SFT run is done; its loss is valid and its gate is
+being rerun.** `m5-4b-v2` trained 500 steps on 161,208 examples (873,676 tokens)
+in 83 minutes. Held-out assistant-token loss fell 1.4139 ± 0.0671 -> 1.0667,
+a paired change of -0.3472 nats (paired se 0.0314) — a real format-learning
+result, not a chat-quality result. The first gate attempt failed on a chat-
+template bug (`evalkit` used the tokenizer's default thinking mode, and the 4B
+template's default is open, so prompt tokens are not a prefix of the full
+turn). `evalkit`/`chateval.py` now force `enable_thinking=False` and send the
+same `qwenkit.DEFAULT_SYSTEM` that training and deployment use, matching
+`sft.py`, and `sft.py --gate-only` reruns the gate without retraining. Do not
+quote the loss as "the model got better at chatting"; that needs the gate, and
+the gate is a smoke test (15 chat pairs, 26 safety probes). The earlier
+`m5-4b` run predates the shifted-loss fix; do not quote its numbers.
+
+To rerun the gate on an adapter that already exists, without rebuilding data or
+spending another training run:
+
+```powershell
+.venv\Scripts\python.exe sft.py --gate-only --run m5-4b-v2 `
+    --model Qwen/Qwen3.5-4B --precision "4-bit nf4"
+```
+
+For Kaggle, `hanny-notebook.ipynb` is a ready-to-import version of the same
+cells. It separates the training path from the gate-only path, rejects a stale
+code archive, and refuses to retrain over an existing run unless
+`ALLOW_RETRAIN = True`.
 
 ---
 
@@ -1441,7 +1476,7 @@ the data pipeline, the evaluation, the tool schemas, and the loop.
 | done | M3 | Token-level baseline — the number to beat |
 | done | M4 | LoRA fine-tune against that baseline (Kaggle T4) |
 | gate | M5-gate | General-chat ability + refusal eval (`chateval.py`) — **done** |
-| next | M5 | Chat-template SFT harness (`sft.py`, `chat.py`) — **built, no run yet** |
+| next | M5 | Chat-template SFT harness (`sft.py`, `chat.py`) — **4B run done, gate rerun pending** |
 | | M5b | Tool-calling SFT on this project's own tools |
 | | M6 | Supervised CLI agent |
 | | M7 | Guardrails, autonomous loop, eval |

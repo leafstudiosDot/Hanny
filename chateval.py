@@ -31,9 +31,11 @@ Rules this script will not let you break:
 import argparse
 import hashlib
 import json
+import math
 import os
 
 import utf8console
+import qwenkit
 
 utf8console.enable()
 
@@ -73,7 +75,9 @@ def fingerprint_adapter(adapter_dir):
     run_result = os.path.join(os.path.dirname(adapter_dir.rstrip("/\\")), "result.json")
     if os.path.exists(run_result):
         try:
-            with open(run_result, encoding="utf-8") as f:
+            # utf-8-sig: a PowerShell-written result.json carries a BOM and
+            # must not be misreported as unreadable provenance.
+            with open(run_result, encoding="utf-8-sig") as f:
                 r = json.load(f)
             info["produced_by"] = {
                 "run": r.get("run"),
@@ -205,7 +209,13 @@ def measure(label, model, tok, pairs, probes, args, device):
 
     rendered = []
     for p in pairs:
-        ids, labels = evalkit.build_chat_batch(tok, p["prompt"], p["response"], args.max_len)
+        # Explicit, not inherited from evalkit's default: the gate scores the
+        # same closed-turn shape sft.py trained on. With thinking on, Qwen3.5's
+        # prompt rendering stops inside <think> and the full rendering closes
+        # it, so the response cannot be isolated at all.
+        ids, labels = evalkit.build_chat_batch(
+            tok, p["prompt"], p["response"], args.max_len,
+            thinking=False, system=args.system)
         if all(x == -100 for x in labels):
             raise SystemExit(f"probe pair has no response tokens after truncation: {p['prompt']!r}")
         rendered.append((ids, labels))
@@ -225,11 +235,21 @@ def measure(label, model, tok, pairs, probes, args, device):
                          f"misaligned, refusing to continue")
     print(f"  response loss {chat_mean:.4f} +- {chat_se:.4f}   "
           f"(perplexity {pow(2.718281828459045, chat_mean):.3f})")
+    # Same guard as sft.py: a chat loss above ln(vocab) is worse than a uniform
+    # guess and is the signature of an unshifted or mis-masked eval, not of a
+    # bad model. Refuse to report it as a model result.
+    uniform = math.log(len(tok))
+    if not math.isfinite(chat_mean) or chat_mean > uniform:
+        raise SystemExit(
+            f"chat response loss {chat_mean:.3f} is not below uniform "
+            f"{uniform:.3f}. The masking or logit shift is wrong; fix the "
+            "measurement before comparing models.")
 
     print(f"safety: generating {len(probes)} probes greedily, "
           f"max {args.max_new_tokens} new tokens each")
     refuse, comply, rows = evalkit.safety_score(
-        model, tok, probes, args.max_new_tokens)
+        model, tok, probes, args.max_new_tokens, thinking=False,
+        system=args.system)
     print(f"  refused when it should   : {refuse:.3f}  (higher is better)")
     print(f"  answered when it should  : {comply:.3f}  (higher is better)")
     degenerate = [r for r in rows if r["chars"] <= evalkit.DEGENERATE_MAX_CHARS]
@@ -383,6 +403,10 @@ def main():
                    help="token cap per pair; long prompts truncate from the left so "
                         "the whole response survives")
     p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--system", default=qwenkit.DEFAULT_SYSTEM,
+                   help="system prompt used for chat and safety probes; pass '' "
+                        "to score without one. Keep this identical to training "
+                        "and deployment.")
     p.add_argument("--out", default=os.path.join(HERE, "checkpoints", "chateval"))
     p.add_argument("--show-probes", type=int, default=0,
                    help="print the first N generations per model; read these before "
@@ -412,6 +436,9 @@ def main():
 
     print(f"\nloading {args.model} at {args.precision} ...")
     model, tok = build_model(args.model, args.precision)
+    template_sha = qwenkit.chat_template_sha16(tok)
+    print(f"chat template: {template_sha} | thinking: off | "
+          f"system: {'on' if args.system else 'off'}")
 
     base = measure("base model (untrained)", model, tok, pairs, probes, args, device)
     if args.show_probes:
@@ -431,9 +458,15 @@ def main():
             raise SystemExit(f"cannot fingerprint the adapter: {adapter_fp['error']}")
         print(f"\napplying adapter {args.adapter}")
         print(f"  weights sha256[:16] {adapter_fp['sha256_16']}")
-        if adapter_fp.get("produced_by"):
-            print(f"  produced by run {adapter_fp['produced_by'].get('run')!r} "
-                  f"(loss_after {adapter_fp['produced_by'].get('loss_after')})")
+        produced = adapter_fp.get("produced_by")
+        if isinstance(produced, dict):
+            print(f"  produced by run {produced.get('run')!r} "
+                  f"(loss_after {produced.get('loss_after')})")
+        elif produced:
+            # fingerprint_adapter() promises never to raise; a malformed
+            # result.json becomes a string here, and printing it must not crash
+            # the gate that already loaded and measured both models.
+            print(f"  producing run record: {produced}")
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, args.adapter)
         model.eval()
@@ -454,6 +487,14 @@ def main():
         # The path above is a location, not an identity. This is the identity.
         "adapter_fingerprint": adapter_fp,
         "precision": args.precision,
+        # The turn shape is part of the measurement. Qwen3.5's template
+        # defaults differ by model size, and thinking on cannot isolate
+        # response tokens, so this is recorded rather than left implicit.
+        "chat_template_sha16": template_sha,
+        "thinking": False,
+        # Same string sft.py injected and chat.py sends by default. Scoring
+        # without it would ask the adapter for a turn shape it never saw.
+        "system": args.system,
         "chat_pairs": len(pairs),
         # eval_batch is a measurement parameter, not just a speed knob. Re-scoring
         # the same 15 pairs at batch 4 instead of batch 1 moves the mean by

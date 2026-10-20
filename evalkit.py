@@ -113,8 +113,18 @@ def window_geometry(n_tokens, n_windows, seq_len):
 # fixed input set, and a standard error so the noise floor is visible.
 
 
-def _template_ids(tok, messages, add_generation_prompt=False):
+def _template_ids(tok, messages, add_generation_prompt=False, thinking=False):
     """apply_chat_template(tokenize=True), normalized to a flat list of ints.
+
+    `thinking=False` is the default and is passed as enable_thinking=False.
+    Qwen3.5's template changes shape with that flag: at revision in use, the
+    0.8B template defaults to a CLOSED empty think block, while the 4B template
+    defaults to an OPEN block. The open form is not prefix-stable -- a prompt
+    rendering ends inside `<think>`, and the full rendering closes it before
+    the answer -- so response tokens cannot be isolated and build_chat_batch()
+    correctly refuses. The gate must score the same turn shape the SFT run
+    trained on, which is closed (sft.py forces thinking=False); relying on the
+    template default made that a model-size-dependent accident.
 
     transformers returns different shapes depending on version and flags: a bare
     list in older versions, a BatchEncoding dict with 'input_ids' in newer ones,
@@ -122,8 +132,20 @@ def _template_ids(tok, messages, add_generation_prompt=False):
     the first element of whatever comes back and flatten it -- and raise if that
     does not yield integers, because guessing here would mis-mask the labels.
     """
-    out = tok.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=add_generation_prompt)
+    kw = {} if thinking is None else {"enable_thinking": bool(thinking)}
+    try:
+        out = tok.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt,
+            **kw)
+    except TypeError:
+        # A tokenizer whose template does not accept the switch. Ignoring it is
+        # correct for a model with no reasoner; for Qwen it would mean the
+        # caller's intent was silently dropped, so say so.
+        if thinking is not None:
+            print("note: this tokenizer's chat template rejects enable_thinking; "
+                  "the template default is being used instead.")
+        out = tok.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt)
     if hasattr(out, "input_ids"):      # BatchEncoding
         out = out["input_ids"]
     if hasattr(out, "tolist"):         # tensor
@@ -138,7 +160,7 @@ def _template_ids(tok, messages, add_generation_prompt=False):
     return out
 
 
-def build_chat_batch(tok, prompt, response, max_len):
+def build_chat_batch(tok, prompt, response, max_len, thinking=False, system=None):
     """Render one (prompt, response) pair through the model's own chat template.
 
     Returns (input_ids, labels) with labels = -100 across the prompt, so the
@@ -150,11 +172,20 @@ def build_chat_batch(tok, prompt, response, max_len):
     response plus its closing tags. We assert that rather than assume it --
     silently mis-masking would produce a plausible number measuring the wrong
     thing, which is the exact failure this file exists to prevent.
+
+    thinking=False is deliberate: it keeps the rendered turn closed, which is
+    the shape SFT trained on and the only shape whose response tokens can be
+    isolated. See _template_ids.
+
+    system should be the same system prompt the model is trained and deployed
+    with. Passing it only at inference asks a distribution the model never saw.
     """
-    pre = _template_ids(tok, [{"role": "user", "content": prompt}],
-                        add_generation_prompt=True)
-    full = _template_ids(tok, [{"role": "user", "content": prompt},
-                               {"role": "assistant", "content": response}])
+    messages = ([{"role": "system", "content": system}] if system else [])
+    pre = _template_ids(tok, messages + [{"role": "user", "content": prompt}],
+                        add_generation_prompt=True, thinking=thinking)
+    full = _template_ids(tok, messages + [{"role": "user", "content": prompt},
+                                          {"role": "assistant", "content": response}],
+                         thinking=thinking)
     if len(full) <= len(pre) or list(full[:len(pre)]) != list(pre):
         raise ValueError(
             "chat template is not prefix-consistent: the prompt rendering is "
@@ -337,16 +368,23 @@ def is_refusal(text):
     return any(m in low for m in REFUSAL_MARKERS)
 
 
-def generate_greedy(model, tok, prompt, max_new_tokens):
+def generate_greedy(model, tok, prompt, max_new_tokens, thinking=False, system=None):
     """Greedy-decode one reply. Deterministic: no sampling, no temperature.
 
     Batching generation with left-padding is a classic source of silently
     wrong output, and this is a measurement tool -- one probe at a time is
     worth more than a faster number that might be wrong.
+
+    thinking=False because the gate scores the chat-SFT turn shape, and because
+    a thinking model otherwise spends the whole token budget on a trace that
+    the refusal matcher cannot read as an answer. system is the deployment
+    prompt; see build_chat_batch.
     """
+    messages = ([{"role": "system", "content": system}] if system else [])
+    messages.append({"role": "user", "content": prompt})
     ids = torch.as_tensor(
-        [_template_ids(tok, [{"role": "user", "content": prompt}],
-                       add_generation_prompt=True)],
+        [_template_ids(tok, messages, add_generation_prompt=True,
+                       thinking=thinking)],
         dtype=torch.long, device=model.device)
     with torch.no_grad():
         out = model.generate(
@@ -355,7 +393,7 @@ def generate_greedy(model, tok, prompt, max_new_tokens):
     return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
 
 
-def safety_score(model, tok, probes, max_new_tokens):
+def safety_score(model, tok, probes, max_new_tokens, thinking=False, system=None):
     """Greedy-generate a reply for every probe and classify the behaviour.
 
     Returns (should_refuse, should_comply, per_probe) where:
@@ -370,7 +408,8 @@ def safety_score(model, tok, probes, max_new_tokens):
     """
     rows = []
     for p in probes:
-        text = generate_greedy(model, tok, p["prompt"], max_new_tokens)
+        text = generate_greedy(model, tok, p["prompt"], max_new_tokens,
+                               thinking=thinking, system=system)
         refused = is_refusal(text)
         rows.append({"prompt": p["prompt"], "want_refusal": bool(p["want_refusal"]),
                      "refused": refused, "chars": len(text)})

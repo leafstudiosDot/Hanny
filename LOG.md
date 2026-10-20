@@ -1009,6 +1009,81 @@ JSON readers now use `utf-8-sig`; writers stay plain UTF-8.
 
 ---
 
+## M5-4B v2 — first valid held-out loss, and the gate's template bug
+
+**What ran.** `Qwen/Qwen3.5-4B`, 4-bit nf4, template
+`a4aee8afcf2e0711`, chat SFT on the public mixture (80k rows; 161,208 train /
+128 val examples), 500 steps x 2048 tokens, `--max-len 1024`. 873,676 train
+tokens seen in 4,960.2 s (82.7 min) on one T4. Adapter: 85.0 MB,
+`sha256[:16] = 0d98c1455a2e592c`; `best_step = 500`, so `adapter-best` and
+`adapter-last` are the same step.
+
+**The valid number.** Held-out assistant-token loss
+`1.413946 ± 0.067077 -> 1.066708`, paired change `-0.347238` nats, paired
+standard error `0.031376` (about 11x the paired se). This is the first 4B
+number that survives the causal-shift fix. It says the format was learned on
+the training distribution. It is not a chat-quality metric and must not be
+reported as one; `chateval.py` is the gate for that.
+
+**Why the gate still has no number.** The auto-gate now reaches
+`chateval.py` (the parent-memory release worked; this was not another OOM),
+then fails in `evalkit.build_chat_batch`:
+
+```
+ValueError: chat template is not prefix-consistent
+```
+
+Cause, measured on the real tokenizers: Qwen3.5's 0.8B template defaults to a
+closed empty think block, but the 4B template defaults to an *open* `<think>`.
+With thinking on, the prompt rendering ends inside the block and the full
+rendering closes it before the answer, so response tokens cannot be isolated.
+`sft.py` had always forced `thinking=False`; `evalkit` relied on the template
+default, which happened to work on 0.8B and fails on 4B. That is a
+model-size-dependent measurement accident, not a model failure.
+
+**Fix.** `evalkit._template_ids()` now takes `thinking=False` and passes
+`enable_thinking=False`, with the same fallback `qwenkit` uses for templates
+that reject the switch. `build_chat_batch()`, `generate_greedy()` and
+`safety_score()` propagate it; `chateval.py` passes it explicitly and records
+`chat_template_sha16`, `"thinking": false` and the system prompt in its result.
+It also now sends `qwenkit.DEFAULT_SYSTEM`, the same string `sft.py` injected
+and `chat.py` sends, instead of scoring a no-system conversation. `lorewrite.py`
+drops its local no-think copy and uses the shared function. Verified against
+the real 4B tokenizer: thinking off is prefix-stable with and without the
+system turn; thinking on still raises; the 0.8B rendering is unchanged. No
+retraining is needed because the training path was already thinking-off.
+
+Smoke-testing `--gate-only` against the 0.8B exposed two more robustness bugs
+on the provenance path: the wrapper read `result.json` without `utf-8-sig`, so
+a PowerShell-written BOM aborted before the gate; and `chateval` assumed
+`adapter_fingerprint["produced_by"]` was always a dict, so the string fallback
+from an unreadable result crashed the gate after both models had been
+measured. Both are fixed; the wrapper now also refuses a `--model` or
+`--precision` that disagrees with the run's recorded values instead of loading
+the wrong weights.
+
+Comparability note: any earlier base reading (`checkpoints/chateval/result.json`
+and the M4-era gate numbers) was scored without the system turn. Post-fix gate
+numbers are a new measurement; re-run the base reading once instead of
+subtracting across the change.
+
+**Rerun without retraining.** `sft.py --gate-only --run m5-4b-v2` launches
+`chateval.py` against the existing `adapter-best` and updates the run's
+`result.json` with `gate` and `gate_exit`. The first `m5-4b` run predates the
+shift fix; its `16.34 -> 15.03` loss and empty gate are artifacts and are not
+comparable. Keep the folder, do not quote it, and do not overwrite it.
+
+**Chat sample.** A one-shot 160-token reply to "Explain a hash table..." was
+coherent but ended mid-sentence at the cap. That is evidence the adapter can
+follow the turn format; it is not a gate result and not a quality claim.
+
+**Next.** Attach the v2 artifact bundle to a Kaggle session, run the fixed
+gate-only path, and read the paired chat and refusal verdicts before quoting
+anything as assistant quality. Then rerun the 4B/9B ceiling test with
+`enable_thinking=False` and retrieval. The old `m5-4b` result stays unpublished.
+
+---
+
 ## Log format going forward
 
 Append a section per milestone with: what changed, the config that produced

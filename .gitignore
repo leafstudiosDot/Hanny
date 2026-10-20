@@ -41,6 +41,7 @@
 # files it expands into are already ignored (checkpoints/, *.safetensors), but
 # the zip itself is a loose file in the repo root and would not be.
 /artifacts.zip
+/m5-4b-artifacts.zip
 
 # pack.py's local allowance list. Gitignored because an allowance has to live
 # somewhere, and recording an accepted string in a tracked pack.py would put

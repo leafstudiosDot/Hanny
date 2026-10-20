@@ -126,40 +126,13 @@ def load_model(model_name, precision):
 # `exit=0`, and not one document among them. 2B escaped only because it
 # happened not to think on two of its three runs.
 #
-# Two defences, both here rather than in evalkit.py, because generate_greedy's
-# template call backs the safety measurement in chateval.py and that file stays
-# frozen:
-#   1. enable_thinking=False on the template call -- the hard switch the Qwen
-#      template documents. A tokenizer whose template does not implement the
-#      flag silently ignores it, which costs nothing for a model that does not
-#      have the reasoner at all.
+# Two defences:
+#   1. evalkit._template_ids now takes thinking=... and defaults to False, so
+#      generate_greedy and the sampling path below both get the closed turn.
+#      That switch is shared with chateval.py rather than duplicated here.
 #   2. cut_think() strips a leftover reasoning block at </think> and returns how
 #      many characters it removed, so meta can say "the switch was ignored"
 #      instead of leaving a trace to be read as a document.
-
-def _template_ids_nothink(tok, messages):
-    """evalkit._template_ids with one behavioural difference: thinking off.
-
-    The shape-normalisation repeats the shared copy on purpose: _template_ids
-    takes no extra kwargs and evalkit.py is frozen, so this pipeline carries
-    the one kwarg it needs locally. Pin this copy next to it -- if the two ever
-    disagree about shapes, they will disagree loudly here and now, which is the
-    right place.
-    """
-    out = tok.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True,
-        enable_thinking=False)
-    if hasattr(out, "input_ids"):      # BatchEncoding
-        out = out["input_ids"]
-    if hasattr(out, "tolist"):         # tensor
-        out = out.tolist()
-    while isinstance(out, list) and len(out) == 1 and isinstance(out[0], list):
-        out = out[0]                   # unwrap the batch dimension
-    if not isinstance(out, list) or not all(isinstance(t, int) for t in out):
-        raise TypeError(
-            "apply_chat_template did not return a flat token-id list; refusing "
-            "to guess (same rule as evalkit._template_ids).")
-    return out
 
 
 _THINK_CLOSE = "</think>"
