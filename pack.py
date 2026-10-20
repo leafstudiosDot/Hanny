@@ -60,15 +60,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # list is explicit rather than a glob over the repo.
 CODE_FILES = [
     "finetune.py",
+    "sft.py",
+    "chat.py",
+    "qwenkit.py",
     "data.py",
     "evalkit.py",
     "chateval.py",
     "utf8console.py",
     "model.py",
     "baseline.py",
+    "gpu_check.py",
     "baseline.json",
     "requirements.txt",
     "README.md",
+    "DATASETS.md",
     "evalsets/chat_probe.jsonl",
     "evalsets/safety_probe_public.jsonl",
     "evalsets/README.md",
@@ -302,8 +307,14 @@ def save_local_allow_example():
     }
 
 
+# Local-only tools, deliberately not in the Kaggle archive. pack.py holds the
+# FORBIDDEN_SUBSTRINGS list it scans for, so shipping it makes its own scanner
+# trip; upload.py imports pack, so it needs the local tree to run at all.
+LOCAL_ONLY = {"pack.py", "upload.py"}
+
+
 def check_code_files():
-    """Every listed shareable file must exist. Missing means the manifest is wrong."""
+    """Every listed shareable file must exist, and every top-level script should be listed."""
     missing = [f for f in CODE_FILES if not os.path.exists(os.path.join(HERE, f))]
     if missing:
         raise SystemExit(
@@ -312,6 +323,15 @@ def check_code_files():
             + "\nEither they were deleted or CODE_FILES is out of date. Fix the "
               "manifest rather than deleting the check -- that is exactly the "
               "bug that dropped finetune.py from the first upload command.")
+    listed = set(CODE_FILES) | LOCAL_ONLY
+    unlisted = sorted(
+        name for name in os.listdir(HERE)
+        if name.endswith(".py") and name not in listed
+        and os.path.isfile(os.path.join(HERE, name)))
+    if unlisted:
+        print("  warning: top-level Python files are in neither CODE_FILES nor "
+              "LOCAL_ONLY: " + ", ".join(unlisted))
+        print("           they will not exist in a Kaggle notebook built from the archive.")
     return CODE_FILES
 
 

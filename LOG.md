@@ -970,6 +970,45 @@ expected smoke output exactly.
 
 ---
 
+## M5 harness — template discovery, no run yet
+
+**What changed.** `sft.py` (chat-format SFT), `chat.py` (interactive),
+`qwenkit.py` (shared loader/template/provenance), `upload.py` (Hub publish with
+a provenance gate), `DATASETS.md` (licence-checked mix, budget, 5B answer).
+`pack.py` ships the new Kaggle-side scripts; `upload.py` and `pack.py` stay
+local because `pack.py` contains the forbidden-phrase list it scans for.
+
+**The measurement that changed the design.** Qwen3.5's chat template does not
+render historical assistant turns the same way it renders the turn being
+learned. Measured on the real tokenizer: the empty
+`<think>\n\n</think>\n\n` block is inserted before the **last** assistant
+message only. So `render(messages[:i+1])` for an earlier turn is *not* a prefix
+of `render(messages)`, and the obvious prefix-masking implementation would
+supervise the wrong tokens or silently drop every turn but the last. `sft.py`
+therefore emits one example per assistant turn, each ending with that turn.
+Confirmed by `template_prefix_unstable = 0` on toy, ultrachat, tulu and
+smol-smoltalk inputs.
+
+**What was verified.** Dry runs on toy JSONL (all supported schemas),
+`HuggingFaceH4/ultrachat_200k` (30 rows, MIT), `allenai/tulu-3-sft-mixture`
+(20 rows, ODC-BY), `HuggingFaceTB/smol-smoltalk` (20 rows, Apache-2.0); a
+1-step, 128-token training run locally; `chat.py` one-shot and streaming against
+the base and the M4 adapter; `upload.py` refusing `code-private` publicly,
+allowing it privately, allowing a fabricated `public-mix`, and refusing a card
+containing a probe phrase. `pack.py --check` passes with 21 shareable files.
+
+**What was NOT done.** No run on the instruction mixture, no T4 run, no live
+Hub push. There is no chat-quality number from this work, and `sft.py
+--dry-run` is not one. M4's `1.5955 -> 1.3256` remains the only measured
+fine-tune result in the repo.
+
+**One correctness fix on the provenance path.** PowerShell 5.1's
+`Set-Content -Encoding UTF8` writes a BOM, and `json.load` rejects it, so a
+valid `result.json` read as missing and the adapter was classified `unknown`.
+JSON readers now use `utf-8-sig`; writers stay plain UTF-8.
+
+---
+
 ## Log format going forward
 
 Append a section per milestone with: what changed, the config that produced

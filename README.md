@@ -228,7 +228,7 @@ It writes two archives, split by who is allowed to see them:
 
 | Archive | Contains | Publishable? |
 | --- | --- | --- |
-| `hanny-code.zip` | all scripts, `baseline.json`, the public probe sets | **yes** |
+| `hanny-code.zip` | every Kaggle-side script, `baseline.json`, the public probe sets (`pack.py` and `upload.py` stay local) | **yes** |
 | `hanny-data.zip` | the code corpus cache, the real safety probes, the **lore corpus and its retrieval probes** | **no** |
 
 The lore corpus is the reason the split exists in the shape it does. It is other
@@ -845,37 +845,100 @@ the 1.5 GB base model.
 
 ## Publishing to Hugging Face
 
-For M8. Three separate things can be published, and only the third is safe with
-your current corpus.
+For M8. Three separate things can be published, and only some of them are safe
+with your current corpus.
 
-**1. The adapter (recommended first).** ~25 MB, Apache-2.0 base, LoRA weights.
-Private to start — it was trained on your private code.
+**1. The adapter.** ~25 MB LoRA weights. `upload.py` writes the model card,
+hashes the weights, and refuses a public repo when the training data was private
+unless you explicitly claim the rights:
 
-```python
-from huggingface_hub import HfApi
-api = HfApi()
-api.create_repo("yourname/hanny-adapter-m4", repo_type="model", private=True)
-api.upload_folder("checkpoints/m4/adapter-best",
-                  "yourname/hanny-adapter-m4", repo_type="model")
+```powershell
+.venv\Scripts\python.exe upload.py --adapter checkpoints/m5/adapter-best --dry-run
+.venv\Scripts\python.exe upload.py --adapter checkpoints/m5/adapter-best `
+    --repo your-name/hanny-0.8b-chat --private
 ```
 
-**2. A merged full model.** ~1.5 GB. Merge the adapter into the base weights
-and upload that if you want a single file anyone can load without `peft`.
+`--dry-run` needs no token and writes `checkpoints/<run>/MODEL_CARD.md` for you
+to read first. A real upload needs `hf auth login` (huggingface_hub 2.x renamed
+the CLI from `huggingface-cli`). Run it locally: `upload.py` imports `pack.py`,
+which is deliberately not in the Kaggle archive because it contains the
+forbidden-phrase list its own scanner looks for.
 
-**3. The training corpus — do not, yet.** `data.py` is built to train on your
-own private source code. You can only grant rights to data you hold rights to,
-so publishing the corpus means either stripping it to code you wrote entirely
-from scratch, or replacing it with a public dataset such as
-`bigcode/the-stack`. This is a provenance decision, not a technical one.
+The refusal is not a formality. `checkpoints/m4/result.json` records a training
+run over your private source corpus, so that adapter is classified
+`code-private`; publishing it publicly is a licence grant you may not be able to
+make. The same applies to any SFT run that includes a local file, which the
+script names by basename and classifies `mixed-private`. Hub-only training data
+is allowed through, with every licence printed.
 
-A model card needs at minimum: base model and licence, your LoRA config, the
-corpus fingerprint, the before/after loss, and an explicit statement about what
-the training data was. `finetune.py` writes most of that into
-`result.json` for you.
+**2. A dataset.** Only if you can grant rights in every row. Hub-derived data is
+usually fine; anything containing `lore/` or your projects is not:
+
+```powershell
+.venv\Scripts\python.exe upload.py --dataset my_chat.jsonl `
+    --dataset-repo your-name/hanny-chat-sft --private
+```
+
+**3. A merged full model.** ~1.5 GB. Merge the adapter into the base weights and
+upload that if you want a single file anyone can load without `peft`. The same
+provenance rule applies, and the merged model hides the adapter's identity — so
+publish the adapter too, or the card describes weights nobody can check.
+
+**The training corpus — do not, yet.** `data.py` is built to train on your own
+private source code. You can only grant rights to data you hold rights to, so
+publishing the corpus means either stripping it to code you wrote entirely from
+scratch, or replacing it with a public dataset such as `bigcode/the-stack`. This
+is a provenance decision, not a technical one. `upload.py` scans a dataset for
+the same path fragments `pack.py` uses and refuses on a hit.
 
 Note that Kaggle Models now largely mirrors Hugging Face — pushing to the Hub
 is the primary move, and Kaggle will surface the model automatically if a
 notebook uses it.
+
+### Chatting with the published weights
+
+An adapter repo is **not** a standalone chat model. It carries
+`adapter_config.json` and the LoRA weights, not the base weights. `transformers`
+can load it directly (`AutoModelForCausalLM.from_pretrained("you/hanny-chat")`),
+but the Hub's inference widget and the Inference Providers serve the repository
+they are pointed at, and applying an arbitrary adapter is not something to
+assume. Three routes actually give you a chat box:
+
+| route | what it is | the catch |
+| --- | --- | --- |
+| **Gradio Space** | loads the base in 4-bit, attaches the adapter with `PeftModel`, streams replies | a free CPU Space is far too slow for 4B; a GPU/ZeroGPU Space is metered |
+| **Merged model** | `merge_and_unload()` into fp16 weights, upload as a normal causal LM | 0.8B ~1.6 GB, 4B ~8 GB, 9B ~18 GB; 9B does not fit a T4 in fp16, so merge on CPU |
+| **Inference Endpoint** | a dedicated container running `transformers` + `peft` | paid, and Qwen3.5's hybrid layers make TGI adapter support a bet, not a plan |
+
+For a 4B merge, use Kaggle (29 GB RAM), not the 1650:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+base_id = "Qwen/Qwen3.5-4B"
+base = AutoModelForCausalLM.from_pretrained(
+    base_id, dtype="float16", device_map={"": "cpu"})
+model = PeftModel.from_pretrained(base, "checkpoints/m5-4b/adapter-best")
+model = model.merge_and_unload()
+model.save_pretrained("merged-4b", safe_serialization=True)
+AutoTokenizer.from_pretrained(base_id).save_pretrained("merged-4b")
+```
+
+```powershell
+hf upload your-name/hanny-4b-chat merged-4b --private
+```
+
+`upload.py` does **not** merge or publish a merged directory — it publishes
+adapters and datasets, and its provenance gate is the reason to keep using it
+for those. A merged model still carries the same training-data obligation; the
+`--private` above is not decoration.
+
+**Testing without publishing:** `chat.py --ask "..."` is the whole loop. On
+Kaggle, a cell can run `!python chat.py --model Qwen/Qwen3.5-4B --adapter
+checkpoints/m5-4b/adapter-best --ask "..."` — one reply, then exit; the REPL
+does not work there because Kaggle gives no stdin. Locally it works for 0.8B,
+and for 4B only at a short context, if at all.
 
 ---
 
@@ -1118,7 +1181,12 @@ The things that will waste an afternoon if you don't know them.
 | --- | --- |
 | `model.py` | Character-level training / eval / generate, one script |
 | `finetune.py` | M4 LoRA fine-tune of `Qwen3.5-0.8B` with a provenance check |
+| `sft.py` | M5 chat-format SFT through the model's own template; runs the gate |
+| `chat.py` | Talk to the base model and/or named adapters, streaming, 4-bit |
+| `qwenkit.py` | Shared loader, chat-template, LoRA-target and fingerprint helpers |
 | `chateval.py` | Scores base-vs-adapter on chat ability and refusal behaviour |
+| `upload.py` | Publishes an adapter/dataset to the Hub, refusing private data |
+| `DATASETS.md` | Which public data to mix, licences, GPU budget, the 5B question |
 | `pack.py` | Builds the upload archives and refuses to publish a leak |
 | `data.py` | Corpus collector with secret-scanning and caching |
 | `evalkit.py` | The one fixed-evaluation implementation, shared by all scripts |
@@ -1135,6 +1203,59 @@ The things that will waste an afternoon if you don't know them.
 | `data_dirs.tmp.txt` | Template for `data_dirs.txt` |
 | `AGENTS.md` | Notes for coding agents working in this repo |
 | `checkpoints/` | Per-run artifacts — gitignored, local only |
+
+---
+
+## Talking to Hanny
+
+`chat.py` is the interactive side: base model, one adapter, or several named
+adapters in one process. It streams, keeps history, and prints the adapter's
+weight hash and provenance before the first token, so you know what answered.
+
+```powershell
+# base model, no adapter
+.venv\Scripts\python.exe chat.py
+
+# the M4 code adapter
+.venv\Scripts\python.exe chat.py --adapter checkpoints/m4/adapter-best
+
+# two adapters, switch with /adapter
+.venv\Scripts\python.exe chat.py `
+    --adapter m4=checkpoints/m4/adapter-best `
+    --adapter chat=checkpoints/m5/adapter-best --use chat
+
+# one-shot, scriptable
+.venv\Scripts\python.exe chat.py --adapter checkpoints/m4/adapter-best --ask "def fib(n):" --json
+```
+
+Inside the REPL: `/reset`, `/system <text>`, `/temp`, `/max`, `/thinking`,
+`/adapter`, `/adapters`, `/save`, `/quit`. `--precision fp16` is available and is
+a *different* measurement; never compare numbers across it.
+
+**The M4 adapter is not a chat model.** It was trained on raw concatenated source
+text, so it learned "continue this file", not "answer this question". Prompted
+through the chat template it will often answer with code, a file header, or a
+continuation of the prompt. `chat.py` prints a warning when the adapter's
+`result.json` has no `chat_template_sha16`, which is the signature of that
+training data. That is evidence about M4, not a bug in the loader.
+
+### What this machine can run
+
+| model, 4-bit | 4 GB GTX 1650 | Kaggle T4 (15 GB) |
+| --- | --- | --- |
+| **0.8B** | chat and eval, ~2.4 tok/s | chat, eval, QLoRA |
+| **4B** | may load at 256–512 tokens — ~2 GB of quantised blocks plus ~1.3 GB of tied embeddings; the default 4096-token context is an OOM. Training: no. | chat, eval, QLoRA |
+| **9B** | no — the untied embedding and LM head are ~4 GB in fp16 before the quantised blocks | chat, eval, tight QLoRA |
+
+Training a 4B model needs the weights **plus** the logits tensor for a 248k
+vocabulary **plus** activations and their gradients. That is a 10 GB-class step
+before batch size enters the picture, which is why the 1650 is not a *slow*
+training card but a card that cannot hold the tensors. Use it for `chat.py` at
+0.8B and for the two gates; use Kaggle for training. `chat.py` has no graceful
+OOM fallback — the process raises. The one exception is
+`finetune.py --max-steps 20 --batch 1`, which fits at 1×512 to prove the code
+path and is not a training run; [Hardware limits](#hardware-limits) has the
+measured VRAM table.
 
 ---
 
@@ -1225,6 +1346,86 @@ not apply. Full reasoning in [`evalsets/README.md`](evalsets/README.md).
 
 ---
 
+## Training the chatbot (M5)
+
+M4's data was raw text. M5's is turn structure: every example is rendered
+through the base model's own chat template and the loss falls only on assistant
+tokens. `sft.py` does that, expands each conversation into one example per
+assistant turn (Qwen's template inserts the empty think block only before the
+*last* assistant message — measured, not assumed), records the template hash,
+and runs `chateval.py` against the finished adapter.
+
+```powershell
+# see the mix, the supervised span, and the drop counts — no GPU
+.venv\Scripts\python.exe sft.py --dry-run --run m5-plan `
+    --from-hub allenai/tulu-3-sft-mixture `
+    --from-hub HuggingFaceH4/ultrachat_200k::default::train_sft `
+    --max-per-source 20000
+
+# Kaggle T4, ~1.5 hours
+.venv\Scripts\python.exe sft.py --run m5 `
+    --from-hub allenai/tulu-3-sft-mixture `
+    --from-hub HuggingFaceH4/ultrachat_200k::default::train_sft `
+    --max-per-source 40000 --max-steps 800 --max-len 1024
+```
+
+`DATASETS.md` has the licence-verified source list, the measured
+tokens-per-GPU-hour budget, the Kaggle cells, and the answer to "can we do 5B".
+The short version: 0.8B is the capability constraint, mixing general data with
+code is mandatory, and a bigger base is a re-baseline, not a flag.
+
+### If the target is 4B (or 9B)
+
+Qwen3.5 in this repo is swept at 0.8B / 2B / 4B / 9B; the family also ships a
+27B, which does not fit a 15 GB T4 even at 4-bit. There is no 7B. The 4B is the
+direct step up and the largest one that leaves a useful training loop inside a
+3-hour session. A 7B from another family is not a drop-in: `sft.py` renders
+whatever template the tokenizer provides, but the template hash, the prefix
+stability and every loss number are new. Run `--dry-run` and read the
+supervised span before spending a GPU-hour.
+
+Same command, with these changes:
+
+```powershell
+.venv\Scripts\python.exe sft.py --run m5-4b `
+    --model Qwen/Qwen3.5-4B `
+    --from-hub allenai/tulu-3-sft-mixture `
+    --from-hub HuggingFaceH4/ultrachat_200k::default::train_sft `
+    --max-per-source 40000 --epochs 1 `
+    --max-len 1024 --max-tokens-per-batch 2048 `
+    --max-steps 500 --eval-every 100
+```
+
+- **`--max-tokens-per-batch 2048`, not 4096.** At 4096 tokens the logits tensor
+  is ~2 GB in fp16, and the fp32 softmax workspace plus its gradient add ~6 GB
+  more. That is before the 4B weights and activations. 2048 fits a 15 GB T4
+  with room; 4096 is a coin flip that costs a session.
+- **500 steps at 2048 tokens is ~1M tokens, roughly 2.5–3 hours.** The 0.8B rate
+  is measured at ~2M tokens per T4-hour. Assume ~5x slower per token for 4B
+  (estimate, not measured here), so ~0.4M tokens/hour. Do not copy the 800-step
+  0.8B recipe and expect it to finish.
+- **9B needs `--max-tokens-per-batch 1024`** and still buys only a few hundred
+  thousand tokens in a 3-hour session. Treat it as a format nudge on a stronger
+  base, not an instruction-tuning run.
+- **There is no resume.** `sft.py` saves `adapter-last` every eval but cannot
+  continue a schedule. `--init-adapter` continues the weights and restarts the
+  LR schedule — a workaround, not a resume. Keep a run inside one 12-hour
+  Kaggle session.
+- **The template hash and every loss number are model-specific.** `result.json`
+  records the 4B template hash; do not compare it with the 0.8B run. `sft.py`
+  computes its own paired before/after loss and does not need `baseline.json`,
+  but the gate still runs and is still a smoke test.
+
+Kaggle's weekly GPU quota is commonly 30 hours (check *Session options* for the
+real number) and sessions cap at 12 hours. Both T4s do not help `sft.py` — it is
+single-process like `finetune.py` — so use one card, or run two experiments.
+
+**Status: harness built, no real M5 run yet.** Nothing here has trained on the
+instruction mixture, so there is no chat-quality number to report. Do not read
+`sft.py --dry-run` as a result.
+
+---
+
 ## Where this is going
 
 The target is a coding agent in the GLM-5 class. GLM-5 is 744B parameters
@@ -1240,7 +1441,7 @@ the data pipeline, the evaluation, the tool schemas, and the loop.
 | done | M3 | Token-level baseline — the number to beat |
 | done | M4 | LoRA fine-tune against that baseline (Kaggle T4) |
 | gate | M5-gate | General-chat ability + refusal eval (`chateval.py`) — **done** |
-| next | M5 | Chat-template training data, mixed with general instruction data |
+| next | M5 | Chat-template SFT harness (`sft.py`, `chat.py`) — **built, no run yet** |
 | | M5b | Tool-calling SFT on this project's own tools |
 | | M6 | Supervised CLI agent |
 | | M7 | Guardrails, autonomous loop, eval |

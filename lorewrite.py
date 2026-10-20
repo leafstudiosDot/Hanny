@@ -173,7 +173,7 @@ def cut_think(text):
     unchanged with 0 -- the common case. With the flag ignored and the trace
     inside the budget, it recovers the document and the non-zero count records
     in meta that the switch was ignored. With the trace consuming the whole
-    budget there is no 发现</think> at all and the document stays the trace it is, for
+    budget there is no </think> at all and the document stays the trace it is, for
     the gate and a human read to see.
     """
     removed = 0
