@@ -61,6 +61,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CODE_FILES = [
     "finetune.py",
     "sft.py",
+    "hub_sync.py",
     "chat.py",
     "qwenkit.py",
     "data.py",

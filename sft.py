@@ -68,6 +68,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import qwenkit  # noqa: E402
+import hub_sync  # noqa: E402
 
 
 def is_kaggle():
@@ -563,6 +564,17 @@ def score_examples(model, examples, pad_id, max_tokens, device):
     return out
 
 
+def write_resume_point(out, core_model, state):
+    """adapter-last + train_state.pt, written together. train_state.pt goes via a
+    temp file and os.replace so a kill mid-write never leaves a torn file."""
+    import torch
+
+    core_model.save_pretrained(os.path.join(out, "adapter-last"))
+    tmp = os.path.join(out, "train_state.pt.tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, os.path.join(out, "train_state.pt"))
+
+
 def run_gate(out, model_name, precision, system=None, env=None):
     """Run chateval.py against an existing run folder's adapter-best.
 
@@ -645,6 +657,19 @@ def main():
                         "so examples would be masked wrongly.")
     p.add_argument("--init-adapter", help="start from an existing adapter (stacks; "
                                           "attribution becomes ambiguous)")
+    p.add_argument("--resume", action="store_true",
+                   help="continue an INTERRUPTED run of the same --run from "
+                        "checkpoints/<run>/train_state.pt + adapter-last (optimizer, "
+                        "LR schedule and data position restored). Needs identical "
+                        "--max-steps/--seed/--max-tokens-per-batch/world size and "
+                        "--epochs 1. To go past a finished run use --init-adapter.")
+    p.add_argument("--save-every", type=int, default=50,
+                   help="every N optimizer steps write adapter-last + train_state.pt "
+                        "and push them to --hub-repo (0 = only at the end)")
+    p.add_argument("--hub-repo", default=os.environ.get("HANNY_HUB_REPO"),
+                   help="PRIVATE Hugging Face model repo (user/name) that mirrors "
+                        "checkpoints so they survive the Kaggle session. Needs "
+                        "HF_TOKEN. Default: $HANNY_HUB_REPO")
     p.add_argument("--gate", action=argparse.BooleanOptionalAction, default=True,
                    help="run chateval.py on the best adapter afterwards")
     p.add_argument("--gate-only", action="store_true",
@@ -781,6 +806,23 @@ def main():
     out = os.path.join(HERE, "checkpoints", args.run)
     os.makedirs(out, exist_ok=True)
 
+    state_path = os.path.join(out, "train_state.pt")
+    sync = hub_sync.HubSync(args.hub_repo, args.run)
+    if args.resume:
+        if args.init_adapter:
+            raise SystemExit("--resume restores an interrupted run; --init-adapter "
+                             "starts a new one from old weights. Pick one.")
+        if args.epochs != 1:
+            raise SystemExit("--resume supports --epochs 1 only; extend the run "
+                             "with --max-steps instead.")
+        if not (os.path.exists(state_path)
+                and os.path.isdir(os.path.join(out, "adapter-last"))):
+            raise SystemExit(f"--resume: {out} has no train_state.pt + adapter-last. "
+                             "Pull them from the Hub first (hub_sync.pull).")
+    elif args.save_every and not sync.enabled:
+        print("\nWARNING: no --hub-repo/HF_TOKEN. Checkpoints stay on this machine "
+              "only and are lost when the Kaggle session ends.")
+
     if ddp:
         # Build on rank 0 only, then share the exact object. Two independent
         # streaming passes are not guaranteed to see the same rows in the same
@@ -864,11 +906,20 @@ def main():
     if not targets:
         raise SystemExit("found no LoRA target modules -- architecture changed?")
 
-    if args.init_adapter:
-        print(f"\nWARNING: starting from {args.init_adapter}. The finished adapter "
-              f"will contain this one's changes too, so its result cannot be "
-              f"attributed to this dataset alone.")
-        model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+    resume_state = None
+    load_from = args.init_adapter
+    if args.resume:
+        # Own file, but it may have come from the Hub: tensors and plain
+        # containers only, no arbitrary unpickling.
+        resume_state = torch.load(state_path, map_location="cpu", weights_only=True)
+        load_from = os.path.join(out, "adapter-last")
+        print(f"\nRESUMING {args.run} at step {resume_state['step']} from {load_from}")
+    if load_from:
+        if not args.resume:
+            print(f"\nWARNING: starting from {args.init_adapter}. The finished adapter "
+                  f"will contain this one's changes too, so its result cannot be "
+                  f"attributed to this dataset alone.")
+        model = PeftModel.from_pretrained(model, load_from, is_trainable=True)
         for name, param in model.named_parameters():
             if "lora_" in name:
                 param.requires_grad_(True)
@@ -914,10 +965,28 @@ def main():
         pct_start=0.03, anneal_strategy="cos", cycle_momentum=False,
         div_factor=10, final_div_factor=10)
 
+    # Anything that changes the batch order or the LR schedule makes a resume
+    # silently wrong, so it is compared, not assumed.
+    meta = {"total_steps": total_steps, "world_size": world_size,
+            "tokens_per_batch": args.max_tokens_per_batch, "seed": args.seed,
+            "grad_accum": args.grad_accum, "n_train": len(train)}
+    start_step, prior_seconds = 0, 0.0
+    if resume_state is not None:
+        if resume_state["meta"] != meta:
+            raise SystemExit(
+                "cannot resume: this run's setup differs from the checkpoint's.\n"
+                f"  checkpoint: {resume_state['meta']}\n  now:        {meta}")
+        opt.load_state_dict(resume_state["opt"])
+        sched.load_state_dict(resume_state["sched"])
+        start_step = int(resume_state["step"])
+        prior_seconds = float(resume_state["seconds"])
+
     curve = os.path.join(out, "curve.csv")
-    if rank == 0:
+    if rank == 0 and resume_state is None:
         with open(curve, "w", encoding="utf-8") as f:
             f.write("step,train_loss,val_loss,val_se,lr,seconds,tokens\n")
+
+    if rank == 0:
 
         print("\n" + "=" * 78)
         print(f"{'step':>6} {'train':>8} {'val':>8} {'se':>7} {'lr':>9} "
@@ -927,9 +996,27 @@ def main():
     rng = np.random.default_rng(args.seed)
     model.train()
     t0 = time.time()
-    running, step, tokens_seen, tokens_since_log = [], 0, 0, 0
+    running, step, tokens_seen, tokens_since_log = [], start_step, 0, 0
     best_val, best_step, best_per_example = float("inf"), 0, None
+    if resume_state is not None:
+        tokens_seen = int(resume_state["tokens_seen"])
+        best_val = float(resume_state["best_val"])
+        best_step = int(resume_state["best_step"])
+        best_per_example = resume_state["best_per_example"]
     stop = False
+
+    def make_state():
+        # tokens_since_log is this rank's count only; x world_size is an
+        # approximation, good enough for a resume (curve.csv is the record).
+        return {
+            "step": step, "meta": meta,
+            "opt": opt.state_dict(), "sched": sched.state_dict(),
+            "tokens_seen": tokens_seen + tokens_since_log * world_size,
+            "best_val": best_val, "best_step": best_step,
+            "best_per_example": (None if best_per_example is None
+                                 else [float(x) for x in best_per_example]),
+            "seconds": prior_seconds + (time.time() - t0),
+        }
 
     for epoch in range(args.epochs):
         batches = make_batches(len(train), lengths, args.max_tokens_per_batch, rng)
@@ -946,6 +1033,8 @@ def main():
             batches = batches[rank * per_rank:(rank + 1) * per_rank]
 
         for bi, b in enumerate(batches):
+            if bi < start_step * args.grad_accum:
+                continue  # resume: this batch was already trained on
             xb, yb, am = pad_batch([train[i] for i in b], tok.pad_token_id)
             xb, yb, am = xb.to(device), yb.to(device), am.to(device)
             loss = model(input_ids=xb, attention_mask=am, labels=yb).loss
@@ -1024,6 +1113,11 @@ def main():
                             f.write(f"{step},{tr:.4f},{va:.4f},{vse:.4f},"
                                     f"{sched.get_last_lr()[0]:.3e},"
                                     f"{time.time()-t0:.1f},{tokens_seen}\n")
+                if (rank == 0 and args.save_every and step % args.save_every == 0
+                        and step < total_steps):
+                    # Rank 0 only; the other rank just waits in the next all-reduce.
+                    write_resume_point(out, core_model, make_state())
+                    sync.push(out, step)  # snapshot now, upload in the background
                 if step >= total_steps:
                     stop = True
                     break
@@ -1039,8 +1133,11 @@ def main():
         core_model.save_pretrained(os.path.join(out, "adapter-best"))
 
     if rank == 0:
-        core_model.save_pretrained(os.path.join(out, "adapter-last"))
-    seconds = time.time() - t0
+        write_resume_point(out, core_model, make_state())
+        # Weights are safe off-box before the gate runs (the gate has OOMed
+        # before, and a crash must not cost the trained adapter).
+        sync.push(out, step, wait=True)
+    seconds = prior_seconds + (time.time() - t0)
 
     # chateval.py loads its own 4-bit copy of the base model. This process still
     # holds the training model, optimizer and last batch; on a 15 GB T4 the 4B
@@ -1120,6 +1217,8 @@ def main():
             "lora_r": args.lora_r,
             "lora_alpha": args.lora_alpha,
             "init_adapter": args.init_adapter,
+            "resumed_from_step": start_step or None,
+            "hub_repo": args.hub_repo,
             "lr": args.lr,
             "epochs": args.epochs,
             "max_len": args.max_len,
@@ -1168,6 +1267,10 @@ def main():
         print("publish it (dry run first; upload.py will refuse a private-data "
               "adapter):")
         print(f"  .venv\\Scripts\\python.exe upload.py --adapter {adapter} --dry-run")
+
+    if rank == 0:
+        # result.json exists now. gate/ is deliberately not pushed (private probes).
+        sync.push(out, step, wait=True)
 
     if ddp:
         # Rank 1 waits here while rank 0 runs the gate, keeping torchrun's

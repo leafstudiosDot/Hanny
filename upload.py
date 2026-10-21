@@ -293,7 +293,7 @@ def build_model_card(info, result, kind, why, args, gate):
                  "from peft import PeftModel\n\n"
                  f"tok = AutoTokenizer.from_pretrained({base_model!r})\n"
                  f"base = AutoModelForCausalLM.from_pretrained({base_model!r}, dtype='float16', device_map='auto')\n"
-                 f"model = PeftModel.from_pretrained(base, {args.adapter_repo!r})\n"
+                 "model = PeftModel.from_pretrained(base, 'YOUR-NAME/adapter-repo')\n"
                  "model.eval()\n\n"
                  "messages = [{'role': 'user', 'content': 'Hello'}]\n"
                  "ids = tok.apply_chat_template(messages, add_generation_prompt=True,\n"
@@ -592,4 +592,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
