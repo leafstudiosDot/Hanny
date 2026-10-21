@@ -182,7 +182,8 @@ a broken notebook rather than a stale upload.
 
 Upload both zips to the same **private** Kaggle Dataset, add a new version, and
 restart the notebook session so `/kaggle/input` sees it. Notebook settings:
-**GPU T4 x2** (one card is used), **Internet on**, **Persistence: Files only**.
+**GPU T4 x2**, **Internet on**, **Persistence: Files only**. The default
+`4b-ddp` config uses both cards for one run; the single-GPU path uses one.
 
 A ready-to-import version of these cells is `hanny-notebook.ipynb` in the repo
 root (`File > Import Notebook`). It has the same version check, the same
@@ -205,8 +206,8 @@ for i in range(torch.cuda.device_count()):
 assert torch.cuda.is_available(), (
     "No GPU visible. In Kaggle use Session options > Accelerator > GPU T4 x2, "
     "save, restart the session, and re-run this cell. sft.py will not train on CPU.")
-print("NOTE: sft.py is single-process and trains on cuda:0 only; the second "
-      "T4 stays idle. See 'Using both T4s' below.")
+print("NOTE: Cell 3 selects the mode. DDP (default '4b-ddp') uses both T4s; "
+      "the single-process path uses cuda:0 only.")
 ```
 
 Cell 1 — dependencies. Re-run in every new session. Do **not** install torch and
@@ -272,10 +273,13 @@ assert torch.cuda.is_available(), "Enable GPU T4 x2 in Notebook settings"
 
 # Reject a stale dataset version before spending GPU time. These needles are the
 # fixes that came out of the first 4B run: shifted eval loss, parent-memory
-# release before the gate, a printable one-shot reply, and thinking-off scoring.
+# release before the gate, a printable one-shot reply, thinking-off scoring,
+# the system-prompt/UTF-8 provenance fixes, and the DDP path.
 expected = {
     "sft.py": ["shift_logits", "empty_cache", "gate_exit", "gate_only",
-               "utf-8-sig"],
+               "utf-8-sig", "--ddp", "torch.distributed", "world_size",
+               "local_sup"],
+    "qwenkit.py": ["cuda_index"],
     "chat.py": ["print(reply)"],
     "evalkit.py": ["enable_thinking", "system=None"],
     "chateval.py": ['"thinking": False', '"system": args.system',
@@ -287,32 +291,42 @@ for fn, needles in expected.items():
     if missing:
         raise SystemExit(
             f"{fn} is stale (missing {missing}); upload the new dataset version")
-print("code version: fixed eval + gate cleanup + chat print + thinking off")
+print("code version: shifted eval + gate cleanup + thinking off + DDP "
+      "supervised-token scaling")
 ```
 
-Cell 3 — pick the run. Do `0.8b` once to validate the pipeline cheaply; `4b` is
-the target.
+Cell 3 — pick the run. `4b-ddp` is the default (both T4s, new run). `4b` is the
+single-GPU v2 recipe; `0.8b` is the cheap pipeline validation.
 
 ```python
 CONFIG = {
-    "0.8b": dict(model="Qwen/Qwen3.5-0.8B", run="m5",       tokens=4096, steps=800),
-    "4b":   dict(model="Qwen/Qwen3.5-4B",  run="m5-4b-v2", tokens=2048, steps=500),
-}["4b"]        # <-- change to "0.8b" for the cheap first pass
+    "0.8b":   dict(model="Qwen/Qwen3.5-0.8B", run="m5",        tokens=4096,
+                   steps=800, ddp=False),
+    "4b":     dict(model="Qwen/Qwen3.5-4B",   run="m5-4b-v2",  tokens=2048,
+                   steps=500, ddp=False),
+    "4b-ddp": dict(model="Qwen/Qwen3.5-4B",   run="m5-4b-ddp", tokens=2048,
+                   steps=250, ddp=True),
+}["4b-ddp"]    # <-- "4b" for the single-GPU v2 recipe; "0.8b" for a cheap pass
 MODEL, RUN = CONFIG["model"], CONFIG["run"]
-print(CONFIG)
+DDP = bool(CONFIG.get("ddp"))
+WORLD_SIZE = 2 if DDP else 1
+STEPS = CONFIG["steps"]
+print(CONFIG, "| ddp", DDP, "| world_size", WORLD_SIZE)
 ```
 
 `m5-4b-v2` is deliberately a new run name. The earlier `m5-4b` was trained
 before the shifted-loss fix, so its held-out loss and gate are not interpretable;
-do not overwrite it, and do not quote its numbers.
+do not overwrite it, and do not quote its numbers. `m5-4b-ddp` is a new run:
+its effective batch is twice the single-GPU recipe, so its loss is not
+comparable with `m5-4b-v2`.
 
 Cell 4 — data check, no weights and no GPU spend. 2000 per source is enough to
 see the mix and the supervised span; the training cell streams the full cap.
 
 ```python
-import subprocess
+import subprocess, sys
 subprocess.run([
-    "python", "sft.py", "--dry-run", "--run", RUN + "-plan",
+    sys.executable, "sft.py", "--dry-run", "--run", RUN + "-plan",
     "--model", MODEL,
     "--from-hub", "allenai/tulu-3-sft-mixture",
     "--from-hub", "HuggingFaceH4/ultrachat_200k::default::train_sft",
@@ -320,26 +334,37 @@ subprocess.run([
 ], cwd="/kaggle/working", check=True)
 ```
 
-Cell 5 — train. Measured: 4B, 500 steps x 2048 tokens took 83 minutes on one T4.
-(The earlier 0.8B reference was ~64 minutes for 555 steps x 4096 tokens.)
-`sft.py` is single-process and uses `cuda:0`; the **T4 x2** setting does not
-make one run faster. Using both GPUs for one run needs DDP, which is not
-implemented. A non-zero `sft.py` exit is usually the gate failing, not training
-dying; read the gate output and keep the adapter either way.
+Cell 5 — train. Measured single-GPU 4B: 500 steps x 2048 tokens took 83 minutes
+on one T4. (The earlier 0.8B reference was ~64 minutes for 555 steps x 4096
+tokens.) The default `4b-ddp` launches two processes through
+`torch.distributed.run`, one per T4. 250 DDP steps process roughly the same
+global tokens as 500 single-GPU steps, but the effective batch is different, so
+`m5-4b-ddp` is not comparable with `m5-4b-v2`. `--grad-accum` must stay at 1.
+A non-zero `sft.py` exit means training or the gate failed; read the gate output
+and keep the adapter either way.
 
 ```python
-import subprocess, time
-t0 = time.time()
-rc = subprocess.run([
-    "python", "sft.py", "--run", RUN, "--model", MODEL,
+import os, subprocess, sys, time, torch
+if DDP and torch.cuda.device_count() < WORLD_SIZE:
+    raise RuntimeError("DDP needs two T4s; enable GPU T4 x2 and restart")
+
+cmd = [
+    sys.executable, "sft.py", "--run", RUN, "--model", MODEL,
     "--from-hub", "allenai/tulu-3-sft-mixture",
     "--from-hub", "HuggingFaceH4/ultrachat_200k::default::train_sft",
     "--max-per-source", "40000", "--epochs", "1",
     "--max-len", "1024",
     "--max-tokens-per-batch", str(CONFIG["tokens"]),
-    "--max-steps", str(CONFIG["steps"]),
+    "--max-steps", str(STEPS),
     "--eval-every", "100",
-], cwd="/kaggle/working").returncode
+]
+if DDP:
+    cmd = [sys.executable, "-m", "torch.distributed.run",
+           "--standalone", f"--nproc_per_node={WORLD_SIZE}"] + cmd[1:] + ["--ddp"]
+print(" ".join(cmd))
+t0 = time.time()
+rc = subprocess.run(cmd, cwd="/kaggle/working",
+                    env=dict(os.environ, PYTHONUNBUFFERED="1")).returncode
 print(f"sft.py exit={rc}  {(time.time()-t0)/60:.1f} min")
 ```
 
@@ -349,9 +374,9 @@ and updates `checkpoints/<run>/result.json` with the gate path and exit code.
 Skip Cell 5 when using this cell; Cell 5 would retrain and overwrite the run.
 
 ```python
-import subprocess
+import subprocess, sys
 rc = subprocess.run([
-    "python", "sft.py", "--gate-only", "--run", RUN,
+    sys.executable, "sft.py", "--gate-only", "--run", RUN,
     "--model", MODEL, "--precision", "4-bit nf4",
 ], cwd="/kaggle/working").returncode
 print(f"gate-only exit={rc}")
@@ -410,8 +435,9 @@ The artifacts zip includes `gate/result.json`, whose `per_probe` rows contain
 the private safety prompts. Keep that zip private; quote only the aggregate
 rates and the paired verdicts.
 
-Download `m5-4b-v2-artifacts.zip` from the Output pane after **Save Version**,
-then locally:
+Download `<run>-artifacts.zip` (for example `m5-4b-v2-artifacts.zip` or
+`m5-4b-ddp-artifacts.zip`) from the Output pane after **Save Version**, then
+locally:
 
 ```powershell
 .venv\Scripts\python.exe pack.py --restore m5-4b-v2-artifacts.zip
@@ -420,24 +446,39 @@ then locally:
 
 `pack.py --restore` refuses to overwrite an existing run; use `--force` only
 when you mean to replace it. `result.json["gate"]` is a path, not a number; read
-the gate file, and do not quote `loss_after` as chat quality.
+the gate file, and do not quote `loss_after` as chat quality. The artifact zip
+contains the gate result and therefore the private safety prompts; keep it
+private. See [`PUBLISHING.md`](PUBLISHING.md) before pushing weights or data to
+the Hub or GitHub.
 
 ---
 
 ### Using both T4s
 
-`sft.py` and `chateval.py` are single-process. They use one GPU (`cuda:0`); the
-second T4 stays idle, and the **GPU T4 x2** setting does not make one run
-faster. Using both GPUs for one run requires Distributed Data Parallel: one
-process per GPU, a sharded batch stream, gradient all-reduce, rank-0-only
-evaluation/saving, and a gate that starts after the worker exits. That is a code
-change, not a notebook setting; it also changes the effective batch and needs a
-new `--run` name. It is not implemented.
+`chateval.py` is single-process and uses one GPU; the gate runs after training,
+not across both cards. `sft.py` has two training paths:
 
-What works today: one T4 for the measured recipe, or two **independent**
-experiments in two sessions (or two subprocesses pinned with
-`CUDA_VISIBLE_DEVICES=0` and `=1`), which is two results rather than one faster
-run. The v2 gate-only rerun involves no training and is fine on one GPU.
+- **single-process** (`4b`, `0.8b`): uses `cuda:0`; the second T4 is idle.
+- **DDP** (`4b-ddp`, `--ddp`): one process per T4 under
+  `torch.distributed.run --standalone --nproc_per_node=2`.
+
+The DDP path builds the dataset once on rank 0 and shares the exact object,
+splits batches disjointly, scales each local loss by
+`local_supervised_tokens / global_supervised_tokens * world_size` before DDP's
+gradient average, and evaluates, saves and runs the gate on rank 0 only. Rank 1
+waits at a barrier during the gate so `torchrun` keeps both workers alive.
+`--grad-accum` must be 1.
+
+DDP changes the effective batch and the loss, so it needs a new `--run` name and
+cannot be compared with `m5-4b-v2`. The first 2-GPU run is the validation of the
+collectives; a single-process smoke test cannot prove them. Training is
+Kaggle-only by policy (`sft.py` refuses local training without
+`--allow-local-training`), and the local 4 GB card cannot hold the 4B model.
+
+Two **independent** experiments are still an option: two Kaggle sessions, or two
+subprocesses pinned with `CUDA_VISIBLE_DEVICES=0` and `=1`. That is two results,
+not one faster run. The v2 gate-only rerun involves no training and is fine on
+one GPU.
 
 ---
 

@@ -56,6 +56,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import timedelta
 
 import numpy as np
 
@@ -67,6 +68,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import qwenkit  # noqa: E402
+
+
+def is_kaggle():
+    """True inside a Kaggle notebook/kernel. Training is Kaggle-only by policy."""
+    return bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+                or os.environ.get("KAGGLE_URL_BASE")
+                or os.path.isdir("/kaggle/working"))
 
 ROLE_MAP = {
     "user": "user", "human": "user", "prompter": "user",
@@ -555,7 +563,7 @@ def score_examples(model, examples, pad_id, max_tokens, device):
     return out
 
 
-def run_gate(out, model_name, precision, system=None):
+def run_gate(out, model_name, precision, system=None, env=None):
     """Run chateval.py against an existing run folder's adapter-best.
 
     Returns (relative gate path or None, exit code). The gate is a separate
@@ -566,6 +574,10 @@ def run_gate(out, model_name, precision, system=None):
     system must be the string the run trained with. `None` means the run was
     trained with --no-system; chateval needs the empty flag to reproduce that,
     not its own default prompt.
+
+    env lets the DDP parent strip RANK/WORLD_SIZE/etc. before spawning the
+    single-process gate; inheriting torchrun's variables is a silent way to
+    make the child look distributed when it is not.
     """
     gate_dir = os.path.join(out, "gate")
     cmd = [sys.executable, os.path.join(HERE, "chateval.py"),
@@ -575,7 +587,7 @@ def run_gate(out, model_name, precision, system=None):
            "--out", gate_dir]
     print("\nrunning the M5 gate (base vs adapter, one process, same precision):")
     print("  " + " ".join(cmd))
-    gate_exit = subprocess.call(cmd)
+    gate_exit = subprocess.call(cmd, env=env)
     gate_path = None
     gate_result = os.path.join(gate_dir, "result.json")
     if gate_exit == 0 and os.path.exists(gate_result):
@@ -638,12 +650,67 @@ def main():
     p.add_argument("--gate-only", action="store_true",
                    help="run only the gate against checkpoints/<run>/adapter-best; "
                         "no data build, no training, and result.json is updated")
+    p.add_argument("--ddp", action="store_true",
+                   help="Distributed Data Parallel, one process per GPU. Launch "
+                        "with: python -m torch.distributed.run --standalone "
+                        "--nproc_per_node=2 sft.py --ddp ...")
+    p.add_argument("--allow-local-training", action="store_true",
+                   help="override the Kaggle-only guard. For a deliberate smoke "
+                        "test only; the local 4 GB card cannot train the 4B model.")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dry-run", action="store_true",
                    help="build and report the dataset, write nothing downstream")
     args = p.parse_args()
 
+    if args.ddp and args.gate_only:
+        raise SystemExit("--ddp is a training mode; --gate-only is single-process.")
+    if args.ddp and args.dry_run:
+        raise SystemExit("--ddp is for an actual training run; --dry-run already "
+                         "builds the dataset without a model.")
+    if args.ddp and args.grad_accum != 1:
+        raise SystemExit("DDP currently requires --grad-accum 1. With variable "
+                         "token batches, per-microbatch gradient scaling across "
+                         "ranks would need a second all-reduce per step; not "
+                         "implemented.")
+
+    ddp = bool(args.ddp)
+    rank, world_size, local_rank = 0, 1, 0
+    if ddp:
+        import torch
+        import torch.distributed as dist
+
+        if "WORLD_SIZE" not in os.environ:
+            raise SystemExit(
+                "--ddp must be launched with torchrun, e.g.\n"
+                "  python -m torch.distributed.run --standalone "
+                "--nproc_per_node=2 sft.py --ddp ...")
+        world_size = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if world_size < 1 or rank < 0 or local_rank < 0:
+            raise SystemExit(f"invalid DDP ranks: RANK={rank} "
+                             f"LOCAL_RANK={local_rank} WORLD_SIZE={world_size}")
+        if local_rank >= torch.cuda.device_count():
+            raise SystemExit(
+                f"LOCAL_RANK={local_rank} but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are visible")
+        if not is_kaggle() and not args.allow_local_training:
+            raise SystemExit(
+                "DDP training is Kaggle-only by policy. Use a Kaggle T4 x2 "
+                "session, or pass --allow-local-training for a deliberate smoke "
+                "test.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
+        if rank != 0:
+            # Keep stderr for real errors; suppress the duplicate data-build and
+            # training progress from worker ranks.
+            sys.stdout = open(os.devnull, "w")
+        elif world_size == 1:
+            print("note: WORLD_SIZE=1 -- DDP smoke path, not a speedup.")
+
     if args.gate_only:
+        if args.ddp:
+            raise SystemExit("--gate-only cannot be combined with --ddp")
         out = os.path.join(HERE, "checkpoints", args.run)
         adapter = os.path.join(out, "adapter-best")
         if not os.path.isdir(adapter):
@@ -698,19 +765,48 @@ def main():
         raise SystemExit("--max-tokens-per-batch must be >= --max-len, or a single "
                          "example can never fill a batch")
 
+    kaggle = is_kaggle()
+    if not args.dry_run and not kaggle and not args.allow_local_training:
+        raise SystemExit(
+            "Training is Kaggle-only by policy. The local GTX 1650 has 4 GB and "
+            "cannot fit the 4B optimizer/activations; use a Kaggle T4 x2 "
+            "session. Pass --allow-local-training only for a deliberate smoke "
+            "test, never for a result you intend to quote.")
+
     from transformers import AutoTokenizer
     tok = qwenkit.configure_tokenizer(AutoTokenizer.from_pretrained(args.model))
     print(f"tokenizer {args.model} | template {qwenkit.chat_template_sha16(tok)}")
     print("\nsources:" if (args.data or args.from_hub) else "\nno sources given")
 
-    train, val, report = build_dataset(tok, args)
-    print_report(report, train, val, tok)
-
     out = os.path.join(HERE, "checkpoints", args.run)
     os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "data_report.json"), "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    print(f"\nwrote {os.path.relpath(os.path.join(out, 'data_report.json'), HERE)}")
+
+    if ddp:
+        # Build on rank 0 only, then share the exact object. Two independent
+        # streaming passes are not guaranteed to see the same rows in the same
+        # order; if their batch counts differ, one rank waits forever in DDP's
+        # all-reduce. This also avoids tokenising 89M tokens twice.
+        cache = os.path.join(out, ".ddp_data.pt")
+        if rank == 0:
+            print("building the DDP dataset on rank 0 ...")
+            train, val, report = build_dataset(tok, args)
+            print_report(report, train, val, tok)
+            torch.save({"train": train, "val": val, "report": report}, cache)
+        dist.barrier()
+        if rank != 0:
+            payload = torch.load(cache, map_location="cpu", weights_only=False)
+            train, val, report = payload["train"], payload["val"], payload["report"]
+        dist.barrier()
+        if rank == 0:
+            os.remove(cache)
+    else:
+        train, val, report = build_dataset(tok, args)
+        print_report(report, train, val, tok)
+
+    if rank == 0:
+        with open(os.path.join(out, "data_report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f"\nwrote {os.path.relpath(os.path.join(out, 'data_report.json'), HERE)}")
 
     if args.dry_run:
         print("\n--dry-run: dataset built, nothing trained.")
@@ -719,14 +815,17 @@ def main():
     import torch
     from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
+    if not torch.cuda.is_available():
         raise SystemExit("SFT needs a GPU; a 1650 cannot fit the optimizer state "
                          "(see README 'Hardware limits'). Use Kaggle, or --dry-run.")
-    torch.manual_seed(args.seed)
+    device = f"cuda:{local_rank}" if ddp else "cuda"
+    # Rank 0's model state is broadcast by DDP at construction. Different seeds
+    # for the other ranks keep dropout masks from being identical; reproducible
+    # only at the same WORLD_SIZE, which is recorded in result.json.
+    torch.manual_seed(args.seed + (rank if ddp else 0))
     np.random.seed(args.seed)
 
-    print(f"\nloading {args.model} at {args.precision} ...")
+    print(f"\nloading {args.model} at {args.precision} on {device} ...")
     model, tok = qwenkit.load(args.model, args.precision, device, tok=tok)
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
@@ -735,22 +834,28 @@ def main():
 
     # Score the untouched base on the same val examples BEFORE the LoRA wrapper.
     # This is the M4 discipline: the comparison is within one run and one
-    # precision, so quantisation cancels out.
-    print("scoring base model on the held-out examples ...")
-    before = score_examples(model, val, tok.pad_token_id,
-                            args.max_tokens_per_batch, device)
-    before_mean, before_se = mean_se(before)
-    print(f"BEFORE  held-out loss {before_mean:.4f} +- {before_se:.4f}")
-    # A chat model can be bad, but it cannot be worse than a uniform guess by
-    # accident on this data. A number above ln(vocab) is the signature of an
-    # eval misalignment (the first 4B run scored unshifted logits at 16.3 nats,
-    # against ln(248077)=12.4). Refuse to train on a metric that cannot be read.
-    uniform = math.log(len(tok))
-    if not math.isfinite(before_mean) or before_mean > uniform:
-        raise SystemExit(
-            f"base held-out loss {before_mean:.3f} is not below uniform "
-            f"{uniform:.3f}. The eval is misaligned or the model is not a chat "
-            "model; fix the measurement before spending GPU time on training.")
+    # precision, so quantisation cancels out. Only rank 0 needs the number; the
+    # other ranks have no result.json to write and would duplicate the work.
+    before = None
+    before_mean = before_se = float("nan")
+    if rank == 0:
+        print("scoring base model on the held-out examples ...")
+        before = score_examples(model, val, tok.pad_token_id,
+                                args.max_tokens_per_batch, device)
+        before_mean, before_se = mean_se(before)
+        print(f"BEFORE  held-out loss {before_mean:.4f} +- {before_se:.4f}")
+        # A chat model can be bad, but it cannot be worse than a uniform guess
+        # by accident on this data. A number above ln(vocab) is the signature of
+        # an eval misalignment (the first 4B run scored unshifted logits at 16.3
+        # nats, against ln(248077)=12.4). Refuse to train on a metric that
+        # cannot be read.
+        uniform = math.log(len(tok))
+        if not math.isfinite(before_mean) or before_mean > uniform:
+            raise SystemExit(
+                f"base held-out loss {before_mean:.3f} is not below uniform "
+                f"{uniform:.3f}. The eval is misaligned or the model is not a "
+                "chat model; fix the measurement before spending GPU time on "
+                "training.")
 
     targets, missing = qwenkit.lora_targets(model)
     print(f"\nLoRA targets: {targets}")
@@ -773,11 +878,20 @@ def main():
             bias="none", task_type="CAUSAL_LM", target_modules=targets))
     model.print_trainable_parameters()
 
+    core_model = model
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank)
+
     lengths = [len(x[0]) for x in train]
     mean_len = sum(lengths) / len(lengths)
     approx_batch = max(1, int(args.max_tokens_per_batch // mean_len))
     batches_per_epoch = max(1, math.ceil(len(train) / approx_batch))
-    steps_per_epoch = max(1, math.ceil(batches_per_epoch / args.grad_accum))
+    # One optimizer step consumes one local batch on every rank, so the global
+    # number of steps is divided by WORLD_SIZE. For WORLD_SIZE=1 this is the
+    # unchanged single-GPU estimate.
+    steps_per_epoch = max(
+        1, math.ceil(batches_per_epoch / (args.grad_accum * world_size)))
     total_steps = steps_per_epoch * args.epochs
     if args.max_steps:
         total_steps = min(total_steps, args.max_steps)
@@ -801,29 +915,69 @@ def main():
         div_factor=10, final_div_factor=10)
 
     curve = os.path.join(out, "curve.csv")
-    with open(curve, "w", encoding="utf-8") as f:
-        f.write("step,train_loss,val_loss,val_se,lr,seconds,tokens\n")
+    if rank == 0:
+        with open(curve, "w", encoding="utf-8") as f:
+            f.write("step,train_loss,val_loss,val_se,lr,seconds,tokens\n")
 
-    print("\n" + "=" * 78)
-    print(f"{'step':>6} {'train':>8} {'val':>8} {'se':>7} {'lr':>9} {'time':>7} {'tokens':>10}")
-    print("=" * 78)
+        print("\n" + "=" * 78)
+        print(f"{'step':>6} {'train':>8} {'val':>8} {'se':>7} {'lr':>9} "
+              f"{'time':>7} {'tokens':>10}")
+        print("=" * 78)
 
     rng = np.random.default_rng(args.seed)
     model.train()
     t0 = time.time()
-    running, step, tokens_seen = [], 0, 0
+    running, step, tokens_seen, tokens_since_log = [], 0, 0, 0
     best_val, best_step, best_per_example = float("inf"), 0, None
     stop = False
 
     for epoch in range(args.epochs):
         batches = make_batches(len(train), lengths, args.max_tokens_per_batch, rng)
+        if ddp:
+            # Each rank gets an equal number of disjoint batches. Dropping the
+            # remainder is deliberate: one rank taking one extra step would
+            # leave the other rank waiting in DDP's all-reduce forever.
+            per_rank = len(batches) // world_size
+            if per_rank < 1:
+                raise RuntimeError(
+                    f"only {len(batches)} batch(es) for WORLD_SIZE={world_size}; "
+                    "raise the dataset or lower --max-tokens-per-batch")
+            batches = batches[:per_rank * world_size]
+            batches = batches[rank * per_rank:(rank + 1) * per_rank]
+
         for bi, b in enumerate(batches):
             xb, yb, am = pad_batch([train[i] for i in b], tok.pad_token_id)
             xb, yb, am = xb.to(device), yb.to(device), am.to(device)
             loss = model(input_ids=xb, attention_mask=am, labels=yb).loss
-            (loss / args.grad_accum).backward()
-            running.append(float(loss.detach()))
-            tokens_seen += int(am.sum())
+            local_tokens = int(am.sum())
+            # The model's loss is a mean over supervised target tokens, not over
+            # every attention token. DDP's gradient average must therefore be
+            # weighted by the number of labels != -100 (after the causal shift),
+            # or a rank whose batch has a higher prompt/padding fraction is
+            # silently over-weighted. --grad-accum is fixed at 1 in this path.
+            local_sup = int((yb[:, 1:] != -100).sum())
+            if local_sup < 1:
+                raise RuntimeError("a DDP batch had no supervised tokens; "
+                                   "refusing to average a NaN loss")
+
+            if ddp:
+                # DDP averages gradients across ranks. Local losses are means
+                # over local supervised tokens; scaling by local/global *
+                # world_size makes that average equal the global supervised-
+                # token mean. Without it, a rank with a shorter final batch
+                # would be over-weighted.
+                token_t = torch.tensor([local_sup], device=device,
+                                       dtype=torch.float32)
+                dist.all_reduce(token_t, op=dist.ReduceOp.SUM)
+                global_tokens = max(1.0, float(token_t.item()))
+                scaled_loss = loss * (local_sup / global_tokens) * world_size
+            else:
+                scaled_loss = loss
+            (scaled_loss / args.grad_accum).backward()
+            # Keep the supervised-token weight with the loss so the logged
+            # train_loss is a global token mean, not a mean of rank means.
+            running.append((float(loss.detach()), local_sup))
+            tokens_since_log += local_tokens
 
             last = bi == len(batches) - 1
             if (bi + 1) % args.grad_accum == 0 or last:
@@ -834,131 +988,195 @@ def main():
                 step += 1
 
                 if step % args.eval_every == 0 or step == total_steps or last:
-                    was_training = model.training
-                    model.eval()
-                    per_ex = score_examples(model, val, tok.pad_token_id,
-                                            args.max_tokens_per_batch, device)
-                    model.train(was_training)
-                    va, vse = mean_se(per_ex)
-                    tr = float(np.mean(running[-50:]))
-                    star = ""
-                    if va < best_val:
-                        best_val, best_step, best_per_example = va, step, per_ex
-                        model.save_pretrained(os.path.join(out, "adapter-best"))
-                        star = "  <- best"
-                    print(f"{step:>6} {tr:>8.4f} {va:>8.4f} {vse:>7.4f} "
-                          f"{sched.get_last_lr()[0]:>9.2e} {time.time()-t0:>6.0f}s "
-                          f"{tokens_seen:>10,}{star}")
-                    with open(curve, "a", encoding="utf-8") as f:
-                        f.write(f"{step},{tr:.4f},{va:.4f},{vse:.4f},"
-                                f"{sched.get_last_lr()[0]:.3e},"
-                                f"{time.time()-t0:.1f},{tokens_seen}\n")
+                    recent = running[-50:]
+                    local_loss = sum(loss_v * n for loss_v, n in recent)
+                    local_n = sum(n for _, n in recent)
+                    stats = torch.tensor(
+                        [local_loss, float(local_n), float(tokens_since_log)],
+                        device=device, dtype=torch.float32)
+                    if ddp:
+                        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                    tr = float(stats[0].item()) / max(1.0, float(stats[1].item()))
+                    tokens_seen += int(stats[2].item())
+                    tokens_since_log = 0
+
+                    # Evaluation and saving are rank-0 only. Other ranks go on
+                    # to the next forward pass and wait in DDP's next backward;
+                    # no extra barrier is needed, and DDP's 60-minute timeout is
+                    # comfortably above this 128-example eval.
+                    if rank == 0:
+                        was_training = model.training
+                        model.eval()
+                        per_ex = score_examples(core_model, val, tok.pad_token_id,
+                                                args.max_tokens_per_batch, device)
+                        model.train(was_training)
+                        va, vse = mean_se(per_ex)
+                        star = ""
+                        if va < best_val:
+                            best_val, best_step, best_per_example = va, step, per_ex
+                            core_model.save_pretrained(
+                                os.path.join(out, "adapter-best"))
+                            star = "  <- best"
+                        print(f"{step:>6} {tr:>8.4f} {va:>8.4f} {vse:>7.4f} "
+                              f"{sched.get_last_lr()[0]:>9.2e} "
+                              f"{time.time()-t0:>6.0f}s {tokens_seen:>10,}{star}")
+                        with open(curve, "a", encoding="utf-8") as f:
+                            f.write(f"{step},{tr:.4f},{va:.4f},{vse:.4f},"
+                                    f"{sched.get_last_lr()[0]:.3e},"
+                                    f"{time.time()-t0:.1f},{tokens_seen}\n")
                 if step >= total_steps:
                     stop = True
                     break
         if stop:
             break
 
-    if best_step == 0:
+    if rank == 0 and best_step == 0:
         model.eval()
-        best_per_example = score_examples(model, val, tok.pad_token_id,
+        best_per_example = score_examples(core_model, val, tok.pad_token_id,
                                           args.max_tokens_per_batch, device)
         best_val, _ = mean_se(best_per_example)
         best_step = step
-        model.save_pretrained(os.path.join(out, "adapter-best"))
+        core_model.save_pretrained(os.path.join(out, "adapter-best"))
 
-    model.save_pretrained(os.path.join(out, "adapter-last"))
+    if rank == 0:
+        core_model.save_pretrained(os.path.join(out, "adapter-last"))
     seconds = time.time() - t0
 
-    import evalkit
-    d, se = evalkit.paired_se(before, best_per_example)
-    print("\n" + "=" * 78)
-    print(f"BEFORE  {before_mean:.4f} +- {before_se:.4f}  (4-bit base, same val set)")
-    print(f"AFTER   {best_val:.4f}          (best at step {best_step} of {step})")
-    print(f"CHANGE  {-d:+.4f} nats paired  (paired se {se:.4f}; "
-          f"perplexity {math.exp(before_mean):.3f} -> {math.exp(best_val):.3f})")
-    print("=" * 78)
-    if abs(d) < 2 * se:
-        print("The paired change is inside 2x its standard error. That is not evidence\n"
-              "of an effect on this val set -- report it as inconclusive, not as a win.")
-    print("\nHeld-out loss is from the same distribution as training data. It says the\n"
-          "format was learned; it cannot say the model became a better assistant.\n"
-          "That question belongs to chateval.py, which is the only gate this repo has.")
+    # chateval.py loads its own 4-bit copy of the base model. This process still
+    # holds the training model, optimizer and last batch; on a 15 GB T4 the 4B
+    # child then OOMs while the parent holds 13.5 GB (seen on the first m5-4b
+    # run, which left gate=null). Free them before spawning it -- on every DDP
+    # rank, so rank 1's card is free while rank 0 runs the gate.
+    try:
+        del xb, yb, am, loss
+    except NameError:
+        pass
+    try:
+        del sched
+    except NameError:
+        pass
+    try:
+        del opt
+    except NameError:
+        pass
+    try:
+        del params
+    except NameError:
+        pass
+    try:
+        del model
+    except NameError:
+        pass
+    try:
+        del core_model
+    except NameError:
+        pass
+    try:
+        # The tokenised examples are no longer needed, and the gate loads its
+        # own model. On a 30 GB Kaggle host this matters: the corpus is still
+        # hundreds of megabytes and the gate child needs room for the base copy.
+        del train, val
+    except NameError:
+        pass
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    result = {
-        "model": args.model,
-        "run": args.run,
-        "kind": "chat-sft",
-        "chat_template_sha16": report["chat_template_sha16"],
-        "thinking": False,
-        "system": report["system"],
-        "sources": report["sources"],
-        "data_counts": report["counts"],
-        "examples": report["examples"],
-        "tokens": {"train_seen": tokens_seen, **report["tokens"]},
-        "lora_r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "init_adapter": args.init_adapter,
-        "lr": args.lr,
-        "epochs": args.epochs,
-        "max_len": args.max_len,
-        "max_tokens_per_batch": args.max_tokens_per_batch,
-        "grad_accum": args.grad_accum,
-        "steps_done": step,
-        "best_step": best_step,
-        "loss_before": round(before_mean, 6),
-        "loss_before_se": round(before_se, 6),
-        "loss_after": round(best_val, 6),
-        "loss_change": round(-d, 6),
-        "paired_se": round(se, 6),
-        "precision": args.precision,
-        "kernels": qwenkit.kernels(),
-        "seed": args.seed,
-        "seconds": round(seconds, 1),
-    }
+    if ddp:
+        dist.barrier()
 
     gate_path = None
     gate_exit = None
-    if args.gate:
-        # chateval.py loads its own 4-bit copy of the base model. This process
-        # still holds the training model, optimizer and last batch; on a 15 GB
-        # T4 the 4B child then OOMs while the parent holds 13.5 GB (seen on the
-        # first m5-4b run, which left gate=null). Free them before spawning it.
-        try:
-            del xb, yb, am, loss
-        except NameError:
-            pass
-        try:
-            del opt
-        except NameError:
-            pass
-        try:
-            del params
-        except NameError:
-            pass
-        try:
-            del model
-        except NameError:
-            pass
-        gc.collect()
-        torch.cuda.empty_cache()
+    if rank == 0:
+        import evalkit
+        d, se = evalkit.paired_se(before, best_per_example)
+        print("\n" + "=" * 78)
+        print(f"BEFORE  {before_mean:.4f} +- {before_se:.4f}  "
+              "(4-bit base, same val set)")
+        print(f"AFTER   {best_val:.4f}          (best at step {best_step} of {step})")
+        print(f"CHANGE  {-d:+.4f} nats paired  (paired se {se:.4f}; "
+              f"perplexity {math.exp(before_mean):.3f} -> "
+              f"{math.exp(best_val):.3f})")
+        print("=" * 78)
+        if abs(d) < 2 * se:
+            print("The paired change is inside 2x its standard error. That is not "
+                  "evidence\nof an effect on this val set -- report it as "
+                  "inconclusive, not as a win.")
+        print("\nHeld-out loss is from the same distribution as training data. It "
+              "says the\nformat was learned; it cannot say the model became a "
+              "better assistant.\nThat question belongs to chateval.py, which is "
+              "the only gate this repo has.")
 
-        gate_path, gate_exit = run_gate(
-            out, args.model, args.precision, report["system"])
+        result = {
+            "model": args.model,
+            "run": args.run,
+            "kind": "chat-sft",
+            "chat_template_sha16": report["chat_template_sha16"],
+            "thinking": False,
+            "system": report["system"],
+            "sources": report["sources"],
+            "data_counts": report["counts"],
+            "examples": report["examples"],
+            "tokens": {"train_seen": tokens_seen, **report["tokens"]},
+            "lora_r": args.lora_r,
+            "lora_alpha": args.lora_alpha,
+            "init_adapter": args.init_adapter,
+            "lr": args.lr,
+            "epochs": args.epochs,
+            "max_len": args.max_len,
+            "max_tokens_per_batch": args.max_tokens_per_batch,
+            "grad_accum": args.grad_accum,
+            "steps_done": step,
+            "best_step": best_step,
+            "loss_before": round(before_mean, 6),
+            "loss_before_se": round(before_se, 6),
+            "loss_after": round(best_val, 6),
+            "loss_change": round(-d, 6),
+            "paired_se": round(se, 6),
+            "precision": args.precision,
+            "kernels": qwenkit.kernels(),
+            "seed": args.seed,
+            "seconds": round(seconds, 1),
+            "ddp": ddp,
+            "world_size": world_size,
+            "launcher": "torch.distributed.run" if ddp else "python",
+            "platform": "kaggle" if kaggle else "local",
+            "allow_local_training": bool(args.allow_local_training),
+        }
 
-    result["gate"] = gate_path
-    result["gate_exit"] = gate_exit
-    with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-    print(f"\nwrote {os.path.relpath(out, HERE)}/result.json, curve.csv, "
-          f"adapter-best/, adapter-last/")
+        if args.gate:
+            # Strip torchrun's environment before spawning the single-process
+            # gate. chateval.py does not initialise DDP, but inheriting RANK
+            # would make an accidental future distributed path look active.
+            gate_env = None
+            if ddp:
+                drop = {"RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
+                        "GROUP_RANK", "ROLE_RANK", "MASTER_ADDR", "MASTER_PORT"}
+                gate_env = {k: v for k, v in os.environ.items() if k not in drop}
+            gate_path, gate_exit = run_gate(
+                out, args.model, args.precision, report["system"], env=gate_env)
 
-    adapter = os.path.relpath(os.path.join(out, "adapter-best"), HERE)
-    print("\ntry it:")
-    print(f"  .venv\\Scripts\\python.exe chat.py --adapter {adapter}")
-    print("publish it (dry run first; upload.py will refuse a private-data adapter):")
-    print(f"  .venv\\Scripts\\python.exe upload.py --adapter {adapter} --dry-run")
-    return 0
+        result["gate"] = gate_path
+        result["gate_exit"] = gate_exit
+        with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(f"\nwrote {os.path.relpath(out, HERE)}/result.json, curve.csv, "
+              f"adapter-best/, adapter-last/")
+
+        adapter = os.path.relpath(os.path.join(out, "adapter-best"), HERE)
+        print("\ntry it:")
+        print(f"  .venv\\Scripts\\python.exe chat.py --adapter {adapter}")
+        print("publish it (dry run first; upload.py will refuse a private-data "
+              "adapter):")
+        print(f"  .venv\\Scripts\\python.exe upload.py --adapter {adapter} --dry-run")
+
+    if ddp:
+        # Rank 1 waits here while rank 0 runs the gate, keeping torchrun's
+        # worker set alive until both sides have finished. It then exits 0.
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank != 0:
+        return 0
+    return 0 if gate_exit in (None, 0) else (gate_exit or 1)
 
 
 if __name__ == "__main__":

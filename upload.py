@@ -86,11 +86,18 @@ def classify(result):
                            "training data cannot be checked at all.")
     if result.get("kind") == "chat-sft":
         sources = result.get("sources") or []
+        if not sources:
+            return "unknown", ("The SFT result records no training sources, so "
+                               "its provenance cannot be checked.")
         local = [s for s in sources if s.get("kind") == "local"]
         if local:
             names = ", ".join(s.get("name", "?") for s in local)
             return "mixed-private", (f"Trained partly on local file(s): {names}. "
                                      f"Those may be your own projects or lore.")
+        hub = [s for s in sources if s.get("kind") == "hub"]
+        if len(hub) != len(sources):
+            return "unknown", ("The SFT result contains source entries that are "
+                               "neither Hub nor local; provenance is unclear.")
         return "public-mix", ("Trained only on Hub datasets, listed in the card. "
                               "Check each dataset's licence before publishing.")
     if result.get("corpus_fingerprint"):
@@ -184,6 +191,12 @@ def build_model_card(info, result, kind, why, args, gate):
                      f"(best at {result.get('best_step', '?')}) | "
                      f"tokens processed: "
                      f"{f'{tokens_seen:,}' if tokens_seen else 'not recorded'}\n")
+        world_size = result.get("world_size", 1)
+        if world_size and world_size > 1:
+            lines.append(
+                f"- Distributed: DDP across {world_size} GPUs "
+                f"(`{result.get('launcher', 'torch.distributed.run')}`); "
+                f"the effective batch is the per-GPU batch times {world_size}.\n")
 
     lines.append("\n## Training data\n")
     if result and result.get("sources"):
@@ -215,8 +228,10 @@ def build_model_card(info, result, kind, why, args, gate):
                 "next-token loss on held-out source-text windows")
         paired = result.get("paired_se")
         if paired is not None:
+            improvement = (result.get("loss_before", 0.0)
+                           - result.get("loss_after", 0.0))
             change = (f"| improvement (before - after) | "
-                      f"{result.get('loss_change', 0):.4f} "
+                      f"{improvement:.4f} "
                       f"(paired se {paired:.4f}) |\n")
             note = ("Both numbers come from the same run at the same precision, and "
                     "the difference is paired item-by-item, so it is the tighter "
@@ -246,11 +261,26 @@ def build_model_card(info, result, kind, why, args, gate):
         lines.append("No held-out loss is recorded for this adapter.\n")
 
     if gate and gate.get("chat_loss_change_paired") is not None:
+        change = gate["chat_loss_change_paired"]
+        se = gate.get("chat_loss_change_paired_se")
+        if se is None:
+            se = float("nan")
+        gate_exit = result.get("gate_exit") if result else None
+        if gate_exit not in (None, 0):
+            status = (f"The gate process exited {gate_exit}; its numbers are "
+                      f"incomplete.\n")
+        else:
+            status = "The gate process completed (exit 0).\n"
+        inconclusive = ""
+        if se is not None and abs(change) < 2 * se:
+            inconclusive = (
+                " That change is within 2x its paired standard error, so it is "
+                "inconclusive on this probe set, not evidence of an improvement. ")
         lines.append(
             f"\nThe M5 gate (`chateval.py`) scored {gate.get('pairs')} chat pairs and "
-            f"reported a paired chat-loss change of "
-            f"{gate['chat_loss_change_paired']:+.4f} "
-            f"+- {gate['chat_loss_change_paired_se']:.4f}. "
+            f"reported a paired chat-loss change of {change:+.4f} "
+            f"+- {se:.4f} (positive = the adapter's loss is lower)."
+            f"{inconclusive}{status}"
             f"That probe set is a smoke test, not a measurement, and the script says "
             f"so on every run. Refusal p-values: "
             f"{json.dumps(gate.get('refusal_p_exact') or {})}.\n")

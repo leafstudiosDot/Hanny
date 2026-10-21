@@ -1011,6 +1011,12 @@ JSON readers now use `utf-8-sig`; writers stay plain UTF-8.
 
 ## M5-4B v2 — first valid held-out loss, and the gate's template bug
 
+> **Update:** the gate was completed later; see "M5-4B v2 gate completed, and
+> the DDP path" below. The gated rerun produced a different adapter under the
+> same run name; the local `0d98c1455a2e592c` copy described here is not the
+> gated one. The loss numbers here are valid for that earlier adapter but are
+> not the current gated run.
+
 **What ran.** `Qwen/Qwen3.5-4B`, 4-bit nf4, template
 `a4aee8afcf2e0711`, chat SFT on the public mixture (80k rows; 161,208 train /
 128 val examples), 500 steps x 2048 tokens, `--max-len 1024`. 873,676 train
@@ -1081,6 +1087,71 @@ follow the turn format; it is not a gate result and not a quality claim.
 gate-only path, and read the paired chat and refusal verdicts before quoting
 anything as assistant quality. Then rerun the 4B/9B ceiling test with
 `enable_thinking=False` and retrieval. The old `m5-4b` result stays unpublished.
+
+---
+
+## M5-4B v2 gate completed, and the DDP path
+
+**What ran.** The fixed notebook retrained `m5-4b-v2` on Kaggle (one T4), then
+ran `sft.py --gate-only` against the resulting adapter. The gated adapter has
+`sha256[:16] = 7720503d592cdfae` and 85.0 MB of weights. It is a **different
+adapter** from the earlier `0d98c1455a2e592c`; the run name was reused, so the
+path alone no longer identifies the weights. Identify adapters by hash.
+
+**Held-out loss.** `1.413946 ± 0.067077 -> 1.067992`, paired change
+`-0.345954` nats, paired se `0.031177` (about 11x the paired se). This is
+format learning on the training distribution, not chat quality. The earlier
+`0d98c145` run's `1.066708` is a different run; do not splice the two.
+
+**Gate, aggregate only (per-probe rows stay private).** 15 chat pairs and 26
+safety probes; chat template `a4aee8afcf2e0711`, thinking off, system on.
+Gate exit `0`.
+
+| measure | base | adapter | paired change | reading |
+| --- | --- | --- | --- | --- |
+| chat response loss | 2.3612 ± 0.1238 | 2.2886 ± 0.1365 | +0.0726, se 0.03735 | 2x se = 0.0747; within noise |
+| refused when it should | 0.900 | 0.900 | 0.000, McNemar p 1.000 | 10/10 identical |
+| answered when it should | 1.000 | 1.000 | 0.000, McNemar p 1.000 | 16/16 identical |
+
+Positive `chat_loss_change` means the adapter's loss is lower, but the change
+does not clear `2x` its paired standard error. It is **inconclusive**, not an
+improvement. The unchanged refusal rates mean these 26 probes saw no collapse;
+they are not a safety audit. Do not quote the held-out loss as evidence of a
+better chatbot.
+
+**DDP implemented, not yet validated on two GPUs.** `sft.py --ddp` now:
+
+- loads one 4-bit model per rank via `qwenkit.cuda_index()` and `cuda:N`;
+- builds the dataset once on rank 0 and shares the exact object before
+  training, so a streaming order mismatch cannot give the ranks different
+  batch counts;
+- drops the remainder after splitting batches, so every rank takes the same
+  number of optimizer steps;
+- scales each local loss by the **supervised** token count
+  (`local_supervised_tokens / global_supervised_tokens * world_size`) before
+  DDP's gradient average, making the update global supervised-token weighted;
+  using attention tokens would over-weight ranks whose batch has more prompt
+  or padding tokens;
+- logs `train_loss` as a supervised-token-weighted global mean; older curves'
+  train column is not directly comparable, while val loss and `result.json` are;
+- evaluates, saves and runs the gate on rank 0 only; rank 1 waits at a barrier
+  during the single-GPU gate so `torchrun` keeps both workers alive;
+- refuses `--grad-accum` other than 1 and refuses `--ddp` with `--dry-run`,
+  `--gate-only`, or without `torchrun`'s `WORLD_SIZE`.
+
+Training is Kaggle-only by policy: a non-Kaggle run exits unless
+`--allow-local-training` is passed. The notebook defaults to `4b-ddp` (new run
+`m5-4b-ddp`, 250 steps, both T4s); 250 DDP steps are roughly the same global
+token budget as 500 single-GPU steps, but the effective batch differs, so it is
+not comparable with `m5-4b-v2`. The first 2-GPU run is the validation of the
+collectives. A local Windows smoke test cannot prove them because this torch
+build has no NCCL; only the non-DDP dry-run and the DDP argument guards were
+exercised locally.
+
+**Publishing.** `upload.py` now records DDP world size and marks a chat-loss
+change within 2x paired se as inconclusive. `PUBLISHING.md` adds the Hub
+model/dataset commands and the GitHub push checklist. No Hub push and no git
+commit/push has happened.
 
 ---
 

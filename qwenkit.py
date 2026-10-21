@@ -96,12 +96,35 @@ def configure_tokenizer(tok):
     return tok
 
 
+def cuda_index(device):
+    """Map ``cuda`` / ``cuda:0`` / ``cuda:1`` to a device index.
+
+    Training with DDP gives each process its own GPU, so a hardcoded 0 would
+    put both ranks on GPU 0. This is deliberately strict: an unrecognised
+    device string is a programming error, not something to silently coerce.
+    """
+    if device == "cuda":
+        return 0
+    if isinstance(device, str) and device.startswith("cuda:"):
+        try:
+            index = int(device.split(":", 1)[1])
+        except ValueError:
+            raise ValueError(f"invalid CUDA device {device!r}") from None
+        if index < 0:
+            raise ValueError(f"invalid CUDA device {device!r}")
+        return index
+    raise ValueError(f"device must be 'cuda' or 'cuda:N', got {device!r}")
+
+
 def load(model_name=DEFAULT_MODEL, precision="4-bit nf4", device=None, tok=None):
     """Load a causal LM + tokenizer at a stated precision. Returns (model, tok).
 
     `tok` lets a caller that already loaded a tokenizer (sft.py does, so it can
     build the dataset before deciding to train at all) reuse it instead of
     constructing a second object with the same template.
+
+    `device` is 'cpu' or a CUDA string such as 'cuda:0' / 'cuda:1'. The latter
+    is what DDP needs: each rank loads its own copy on its own card.
 
     Precision is not a speed knob here. fp16 and 4-bit NF4 differ by ~0.086 nats
     on this model -- a third of the effect M4 measured -- so a number produced
@@ -127,19 +150,26 @@ def load(model_name=DEFAULT_MODEL, precision="4-bit nf4", device=None, tok=None)
             print("note: no CUDA -- loading float32 on CPU; 4-bit needs a GPU.")
         model = AutoModelForCausalLM.from_pretrained(
             model_name, dtype=torch.float32, device_map={"": "cpu"})
-    elif precision == "fp16":
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.float16, device_map={"": 0})
     else:
-        from transformers import BitsAndBytesConfig
-        # Identical flags to finetune.py, chateval.py and lorewrite.py. If this
-        # block changes, every recorded loss changes with it.
-        bnb = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, quantization_config=bnb, dtype=torch.float16,
-            device_map={"": 0})
+        index = cuda_index(device)
+        if index >= torch.cuda.device_count():
+            raise ValueError(
+                f"device {device!r} requested but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are visible")
+        if precision == "fp16":
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, dtype=torch.float16, device_map={"": index})
+        else:
+            from transformers import BitsAndBytesConfig
+            # Identical flags to finetune.py, chateval.py and lorewrite.py. If
+            # this block changes, every recorded loss changes with it.
+            bnb = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, quantization_config=bnb, dtype=torch.float16,
+                device_map={"": index})
     model.eval()
     return model, tok
 

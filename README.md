@@ -788,6 +788,10 @@ filename from the same model-and-question pair and overwrite each other's
 document — the lore equivalent of two `finetune.py` runs sharing a
 `checkpoints/<run>/` directory.
 
+`finetune.py` remains single-process. `sft.py` now has a separate **DDP** path
+for one run across both T4s; see [DDP (both T4s, one run)](#ddp-both-t4s-one-run)
+for the command and the comparability caveat.
+
 ### Nine things that will bite you
 
 **Cell 1 does not survive a session restart.** Kaggle's pip installs are
@@ -800,11 +804,12 @@ is a missing step, and it looks identical to a dependency conflict.
 `torch==2.11.0+cu128` from the cu128 index and would overwrite the
 CUDA-matched torch Kaggle already ships. Cell 1 installs the M4 subset instead.
 
-**GPU 2 sits at 0% and that is expected.** This is a single-process run; nothing
-here uses DDP or device maps, so the second T4 is idle. Two GPUs would roughly
-halve the wall clock, but that is a different recipe, not a switch — see
-[Using both T4s](#using-both-t4s) for the cheap version, which is two
-concurrent experiments rather than one faster one.
+**GPU 2 sits at 0% and that is expected.** This is a single-process run; this
+`finetune.py` path does not use DDP, so the second T4 is idle. Two GPUs would
+roughly halve the wall clock, but that is a different recipe, not a switch. For
+two concurrent `finetune.py` experiments see
+[Using both T4s](#using-both-t4s); for one DDP `sft.py` run see
+[DDP (both T4s, one run)](#ddp-both-t4s-one-run).
 
 **Expect ~65 minutes, and do not go hunting for the cause if you see ~7
 s/step.** 555 steps at 4096 tokens each on one T4 is a ~66 minute run on this
@@ -845,24 +850,32 @@ the 1.5 GB base model.
 
 ## Publishing to Hugging Face
 
-For M8. Three separate things can be published, and only some of them are safe
-with your current corpus.
+`PUBLISHING.md` is the release checklist. This section explains what `upload.py`
+decides and what must be true before you follow that checklist. Three separate
+things can be published, and only some of them are safe with your current
+corpus.
 
-**1. The adapter.** ~25 MB LoRA weights. `upload.py` writes the model card,
-hashes the weights, and refuses a public repo when the training data was private
-unless you explicitly claim the rights:
+**1. The adapter.** 85 MB for the gated 4B run (25 MB for a 0.8B run).
+`upload.py` writes the model card, hashes the weights, and refuses a public repo
+when the training data was private unless you explicitly claim the rights.
+
+The local `checkpoints/m5-4b-v2` folder is the old `0d98c1455a2e592c` adapter;
+restore and verify the gated `7720503d592cdfae` artifact first, as described in
+`PUBLISHING.md`. Once it is in place:
 
 ```powershell
-.venv\Scripts\python.exe upload.py --adapter checkpoints/m5/adapter-best --dry-run
-.venv\Scripts\python.exe upload.py --adapter checkpoints/m5/adapter-best `
-    --repo your-name/hanny-0.8b-chat --private
+.venv\Scripts\python.exe upload.py --adapter checkpoints/m5-4b-v2/adapter-best --dry-run
+.venv\Scripts\python.exe upload.py --adapter checkpoints/m5-4b-v2/adapter-best `
+    --repo your-name/hanny-4b-chat --private --license other
 ```
 
 `--dry-run` needs no token and writes `checkpoints/<run>/MODEL_CARD.md` for you
 to read first. A real upload needs `hf auth login` (huggingface_hub 2.x renamed
 the CLI from `huggingface-cli`). Run it locally: `upload.py` imports `pack.py`,
 which is deliberately not in the Kaggle archive because it contains the
-forbidden-phrase list its own scanner looks for.
+forbidden-phrase list its own scanner looks for. A private push is the safe
+first upload for the old adapter or for comparison; a public push is only for
+the verified gated artifact.
 
 The refusal is not a formality. `checkpoints/m4/result.json` records a training
 run over your private source corpus, so that adapter is classified
@@ -879,10 +892,11 @@ usually fine; anything containing `lore/` or your projects is not:
     --dataset-repo your-name/hanny-chat-sft --private
 ```
 
-**3. A merged full model.** ~1.5 GB. Merge the adapter into the base weights and
-upload that if you want a single file anyone can load without `peft`. The same
-provenance rule applies, and the merged model hides the adapter's identity — so
-publish the adapter too, or the card describes weights nobody can check.
+**3. A merged full model.** ~8 GB for 4B (~1.5 GB for 0.8B). Merge the adapter
+into the base weights and upload that if you want a single file anyone can load
+without `peft`. The same provenance rule applies, and the merged model hides the
+adapter's identity — so publish the adapter too, or the card describes weights
+nobody can check.
 
 **The training corpus — do not, yet.** `data.py` is built to train on your own
 private source code. You can only grant rights to data you hold rights to, so
@@ -1095,7 +1109,10 @@ classes makes the logits, not the weights, the memory bottleneck — 752M
 parameters is only 1.50 GB in fp16.
 
 **So this card can evaluate the model but cannot train it.** Optimizer states
-do not fit. M4 runs on Kaggle T4.
+do not fit, and the 4B model does not fit at all. M4 and M5 run on Kaggle T4.
+`sft.py` enforces this: training outside Kaggle exits unless
+`--allow-local-training` is passed for a deliberate smoke test. `--dry-run` and
+`--gate-only` do not train and are not blocked by that guard.
 
 Two more reasons Kaggle rather than local:
 
@@ -1181,11 +1198,12 @@ The things that will waste an afternoon if you don't know them.
 | --- | --- |
 | `model.py` | Character-level training / eval / generate, one script |
 | `finetune.py` | M4 LoRA fine-tune of `Qwen3.5-0.8B` with a provenance check |
-| `sft.py` | M5 chat-format SFT through the model's own template; runs the gate |
+| `sft.py` | M5 chat-format SFT through the model's own template; single-GPU and DDP; runs the gate |
 | `chat.py` | Talk to the base model and/or named adapters, streaming, 4-bit |
 | `qwenkit.py` | Shared loader, chat-template, LoRA-target and fingerprint helpers |
 | `chateval.py` | Scores base-vs-adapter on chat ability and refusal behaviour |
 | `upload.py` | Publishes an adapter/dataset to the Hub, refusing private data |
+| `PUBLISHING.md` | Hub model/dataset commands, Kaggle archive upload, GitHub push checklist |
 | `DATASETS.md` | Which public data to mix, licences, GPU budget, the 5B question |
 | `pack.py` | Builds the upload archives and refuses to publish a leak |
 | `data.py` | Corpus collector with secret-scanning and caching |
@@ -1429,22 +1447,34 @@ do not quote its numbers or overwrite it. `m5-4b-v2` is the comparable run.
   but the gate still runs and is still a smoke test.
 
 Kaggle's weekly GPU quota is commonly 30 hours (check *Session options* for the
-real number) and sessions cap at 12 hours. Both T4s do not help `sft.py` — it is
-single-process like `finetune.py` — so use one card, or run two experiments.
+real number) and sessions cap at 12 hours. The single-process `sft.py` path uses
+one card, like `finetune.py`. The DDP path uses both T4s for **one** run; it is a
+different recipe and needs a new `--run` name.
 
-**Status: the first 4B chat-SFT run is done; its loss is valid and its gate is
-being rerun.** `m5-4b-v2` trained 500 steps on 161,208 examples (873,676 tokens)
-in 83 minutes. Held-out assistant-token loss fell 1.4139 ± 0.0671 -> 1.0667,
-a paired change of -0.3472 nats (paired se 0.0314) — a real format-learning
-result, not a chat-quality result. The first gate attempt failed on a chat-
-template bug (`evalkit` used the tokenizer's default thinking mode, and the 4B
-template's default is open, so prompt tokens are not a prefix of the full
-turn). `evalkit`/`chateval.py` now force `enable_thinking=False` and send the
-same `qwenkit.DEFAULT_SYSTEM` that training and deployment use, matching
-`sft.py`, and `sft.py --gate-only` reruns the gate without retraining. Do not
-quote the loss as "the model got better at chatting"; that needs the gate, and
-the gate is a smoke test (15 chat pairs, 26 safety probes). The earlier
-`m5-4b` run predates the shifted-loss fix; do not quote its numbers.
+**Status: the 4B chat-SFT run has a valid loss and a completed gate; the DDP
+path is implemented but its first 2-GPU validation run is still pending.**
+`m5-4b-v2` trained 500 steps over 161,208 examples, processing 873,676 training
+tokens (the dataset holds 89.1M), in 83 minutes.
+The gated adapter is the one with weights `sha256[:16] 7720503d592cdfae`.
+Held-out assistant-token loss fell 1.413946 ± 0.067077 -> 1.067992, a paired
+change of -0.345954 nats (paired se 0.031177) — format learning on the training
+distribution, not chat quality.
+
+The gate (`chateval.py`, 15 chat pairs, 26 safety probes) completed with exit 0:
+
+| measure | base | adapter | paired change | result |
+| --- | --- | --- | --- | --- |
+| chat response loss | 2.3612 ± 0.1238 | 2.2886 ± 0.1365 | +0.0726 (se 0.03735) | within 2x se (0.0747) — inconclusive |
+| refused when it should | 0.900 | 0.900 | 0.000 (McNemar p 1.000) | 10/10 probes identical |
+| answered when it should | 1.000 | 1.000 | 0.000 (McNemar p 1.000) | 16/16 probes identical |
+
+Positive `chat_loss_change` means the adapter's loss is lower, but this change
+is inside the noise floor. **Do not report it as evidence of a better chatbot.**
+The safety result means these 26 probes saw no collapse; it is not a safety
+audit. The earlier `m5-4b` run predates the shifted-loss fix and is not
+quotable. The local `checkpoints/m5-4b-v2` adapter is still the earlier
+`0d98c1455a2e592c`; the gated `7720503d592cdfae` weights exist only in the
+Kaggle artifact. Identify adapters by hash, not by path.
 
 To rerun the gate on an adapter that already exists, without rebuilding data or
 spending another training run:
@@ -1458,6 +1488,46 @@ For Kaggle, `hanny-notebook.ipynb` is a ready-to-import version of the same
 cells. It separates the training path from the gate-only path, rejects a stale
 code archive, and refuses to retrain over an existing run unless
 `ALLOW_RETRAIN = True`.
+
+### DDP (both T4s, one run)
+
+`sft.py` has a DDP path for Kaggle's two T4s. It is **Kaggle-only by policy**:
+training on the local 4 GB card is refused unless `--allow-local-training` is
+passed for a deliberate smoke test. The DDP run is a new experiment, not a
+faster version of `m5-4b-v2`; its effective batch and loss are different.
+
+```powershell
+# On Kaggle, from /kaggle/working, after Cell 1 and Cell 2:
+python -m torch.distributed.run --standalone --nproc_per_node=2 sft.py `
+    --ddp --run m5-4b-ddp --model Qwen/Qwen3.5-4B `
+    --from-hub allenai/tulu-3-sft-mixture `
+    --from-hub HuggingFaceH4/ultrachat_200k::default::train_sft `
+    --max-per-source 40000 --epochs 1 `
+    --max-len 1024 --max-tokens-per-batch 2048 `
+    --max-steps 250 --eval-every 100
+```
+
+The dataset is built once on rank 0 and shared before training; batches are
+disjoint across ranks; each local loss is scaled by `local_supervised_tokens /
+global_supervised_tokens * world_size` before DDP's gradient average, so the
+update is global supervised-token weighted. Only rank 0 evaluates, saves and
+runs the gate, while rank 1 waits at a barrier so `torchrun` keeps both workers
+alive. `--grad-accum` must be 1. A 250-step DDP run processes roughly the same
+global tokens as the 500-step single-GPU recipe. The first 2-GPU run is the
+validation of the collectives; a single-process smoke test cannot prove them.
+
+`hanny-notebook.ipynb` defaults to the `4b-ddp` config and adds `--ddp`
+automatically. Set `4b` in Cell 3 for the single-GPU path or a v2 gate-only
+rerun.
+
+### Publishing
+
+The gated adapter was trained only on public data (`allenai/tulu-3-sft-mixture`,
+ODC-BY; `HuggingFaceH4/ultrachat_200k`, MIT), so `upload.py` classifies it as
+`public-mix`. The model card must preserve the smoke-test caveat above. See
+[`PUBLISHING.md`](PUBLISHING.md) for the Hugging Face model/dataset commands and
+the GitHub push checklist. Those commands are instructions, not steps this
+repository runs for you; git writes remain the user's decision.
 
 ---
 
@@ -1475,8 +1545,8 @@ the data pipeline, the evaluation, the tool schemas, and the loop.
 | done | M2 | Fixed evaluation set, standard errors, `curve.csv` |
 | done | M3 | Token-level baseline — the number to beat |
 | done | M4 | LoRA fine-tune against that baseline (Kaggle T4) |
-| gate | M5-gate | General-chat ability + refusal eval (`chateval.py`) — **done** |
-| next | M5 | Chat-template SFT harness (`sft.py`, `chat.py`) — **4B run done, gate rerun pending** |
+| gate | M5-gate | General-chat ability + refusal eval (`chateval.py`) — **done; smoke test, change within noise** |
+| next | M5 | Chat-template SFT harness (`sft.py`, `chat.py`) — **4B gated; DDP validation pending** |
 | | M5b | Tool-calling SFT on this project's own tools |
 | | M6 | Supervised CLI agent |
 | | M7 | Guardrails, autonomous loop, eval |

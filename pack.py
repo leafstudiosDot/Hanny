@@ -74,6 +74,7 @@ CODE_FILES = [
     "requirements.txt",
     "README.md",
     "DATASETS.md",
+    "PUBLISHING.md",
     "evalsets/chat_probe.jsonl",
     "evalsets/safety_probe_public.jsonl",
     "evalsets/README.md",
