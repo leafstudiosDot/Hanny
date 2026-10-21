@@ -160,11 +160,18 @@ def _template_ids(tok, messages, add_generation_prompt=False, thinking=False):
     return out
 
 
-def build_chat_batch(tok, prompt, response, max_len, thinking=False, system=None):
+def build_chat_batch(tok, prompt, response, max_len, thinking=False, system=None,
+                     history=None):
     """Render one (prompt, response) pair through the model's own chat template.
 
     Returns (input_ids, labels) with labels = -100 across the prompt, so the
     loss is computed on response tokens only.
+
+    `history` is an optional list of earlier turns ({"role", "content"}) inserted
+    after the system message and before `prompt`. Multi-turn probes have to be
+    rendered as real turns: folding "I said my sister is called Ada" into the
+    prompt string would ask the model to read a quotation, not to use a
+    conversation, and the two are different measurements.
 
     The prompt half is rendered with add_generation_prompt=True and the full
     pair without it. When the template is well-formed the prompt rendering is a
@@ -181,10 +188,28 @@ def build_chat_batch(tok, prompt, response, max_len, thinking=False, system=None
     with. Passing it only at inference asks a distribution the model never saw.
     """
     messages = ([{"role": "system", "content": system}] if system else [])
-    pre = _template_ids(tok, messages + [{"role": "user", "content": prompt}],
-                        add_generation_prompt=True, thinking=thinking)
-    full = _template_ids(tok, messages + [{"role": "user", "content": prompt},
-                                          {"role": "assistant", "content": response}],
+    if history:
+        if not isinstance(history, (list, tuple)):
+            raise ValueError(f"history must be a list of turns, got "
+                             f"{type(history).__name__}")
+        for i, turn in enumerate(history):
+            # Deliberately strict. A malformed turn that is silently dropped
+            # turns a multi-turn probe into a single-turn one, and the resulting
+            # loss looks perfectly reasonable while measuring something else.
+            if not isinstance(turn, dict):
+                raise ValueError(f"history[{i}] is {type(turn).__name__}, not a dict")
+            role, content = turn.get("role"), turn.get("content")
+            if role not in ("user", "assistant"):
+                raise ValueError(f"history[{i}] role is {role!r}; only 'user' and "
+                                 f"'assistant' are valid (the system prompt is the "
+                                 f"system= argument, not a turn)")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(f"history[{i}] ({role}) has no content")
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": prompt})
+
+    pre = _template_ids(tok, messages, add_generation_prompt=True, thinking=thinking)
+    full = _template_ids(tok, messages + [{"role": "assistant", "content": response}],
                          thinking=thinking)
     if len(full) <= len(pre) or list(full[:len(pre)]) != list(pre):
         raise ValueError(

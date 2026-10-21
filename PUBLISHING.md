@@ -90,7 +90,8 @@ publishing a different DDP run later, record its own hash and gate.
 plan without touching the network. Read the card. It must say, in substance:
 
 - the held-out loss is a **format-learning** measurement, not chat quality;
-- the 15-pair / 26-probe gate is a **smoke test**;
+- the chat gate is a **floor**, not a certification (it scores a fixed probe
+  set far smaller than a safety audit);
 - the paired chat change is **within 2x its standard error**, so it is
   inconclusive, not an improvement;
 - refusal rates were unchanged on these probes, which is not a safety audit;

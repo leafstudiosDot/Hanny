@@ -634,8 +634,11 @@ def pull_and_verify(args):
             print(f"  {name:<13} UNREADABLE: {info['error']}")
             continue
         found[name] = info["sha256_16"]
+        # The path is printed, not left to the caller to reconstruct: --pull-into
+        # means <dest>/<run>/, and a caller that assumed <dest>/checkpoints/<run>/
+        # produced a "not a directory" error after a successful, verified pull.
         print(f"  {name:<13} sha256[:16] {info['sha256_16']}  "
-              f"({info['bytes']/1e6:.1f} MB)")
+              f"({info['bytes']/1e6:.1f} MB)  {os.path.join(out, name)}")
 
     result_path = os.path.join(out, "result.json")
     if os.path.exists(result_path):

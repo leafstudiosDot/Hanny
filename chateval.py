@@ -15,6 +15,9 @@ and a fixed safety probe set, both at the same precision.
 Run it:
     .venv\\Scripts\\python.exe chateval.py --adapter checkpoints/m4/adapter-best
 
+Validate the probe set alone (tokenizer only, no weights, no GPU):
+    .venv\\Scripts\\python.exe chateval.py --check-probes
+
 The adapter argument is optional: with no adapter you get a base-model reading,
 which is the reference you compare every future run against. Do that once and
 keep the number.
@@ -107,9 +110,10 @@ def file_sha256_16(path):
 def load_probe(name):
     """Read a probe set from evalsets/<name>.jsonl. Fails loudly if it is short.
 
-    n matters here more than it does for the code eval. Fifteen chat pairs is a
-    smoke test, not a measurement, so the script says so rather than printing a
-    confident-looking number nobody should trust.
+    n matters here more than it does for the code eval. Below the 40-pair claim
+    threshold the standard error is too wide to support a conclusion, so
+    check_probe_sanity() says so rather than printing a confident-looking number
+    nobody should trust.
     """
     path = os.path.join(EVALSETS, name)
     if not os.path.exists(path):
@@ -161,12 +165,49 @@ def load_safety_probes():
 
 
 def check_probe_sanity(pairs):
-    """Warn when the probe set is too small to support a conclusion.
+    """Validate the probe set's shape, then warn when it is too small.
 
     A standard error over a handful of samples is large, and a large se is the
     honest answer -- it just needs to be visible before anyone acts on the
     number rather than after.
+
+    The schema check is here rather than in load_probe() because load_probe()
+    is shared with the safety probes, which have a different shape. Everything
+    that can go wrong with a chat probe goes wrong *quietly*: a missing response
+    becomes a crash after the model loads, a duplicated prompt makes two
+    positions in the per-pair array describe the same question, and a malformed
+    history turn silently turns a multi-turn probe into a single-turn one.
     """
+    seen = {}
+    for i, p in enumerate(pairs, 1):
+        if not isinstance(p, dict):
+            raise SystemExit(f"chat probe {i} is {type(p).__name__}, not an object")
+        for key in ("prompt", "response"):
+            value = p.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise SystemExit(f"chat probe {i} has no non-empty {key!r}")
+        hist = p.get("history")
+        if hist is not None:
+            if not isinstance(hist, list) or not hist:
+                raise SystemExit(f"chat probe {i}: 'history' must be a non-empty "
+                                 f"list, or omitted entirely")
+            for j, turn in enumerate(hist):
+                if (not isinstance(turn, dict)
+                        or turn.get("role") not in ("user", "assistant")
+                        or not isinstance(turn.get("content"), str)
+                        or not turn["content"].strip()):
+                    raise SystemExit(
+                        f"chat probe {i} history[{j}] must be "
+                        f"{{'role': 'user'|'assistant', 'content': <text>}}")
+        # Identity is the whole conversation, not the last prompt: two probes may
+        # deliberately share a closing question if their histories differ.
+        key = json.dumps([hist, p["prompt"]], sort_keys=True)
+        if key in seen:
+            raise SystemExit(f"chat probes {seen[key]} and {i} are the same "
+                             f"conversation; duplicate rows distort the mean and "
+                             f"make the per-pair array ambiguous")
+        seen[key] = i
+
     if len(pairs) < MIN_PAIRS_FOR_CLAIM:
         print(f"WARNING: only {len(pairs)} chat pairs. Below ~{MIN_PAIRS_FOR_CLAIM} "
               f"the standard error is too wide to support a claim about general "
@@ -176,6 +217,47 @@ def check_probe_sanity(pairs):
 
 MIN_PAIRS_FOR_CLAIM = 40
 MIN_SAMPLES_FOR_SE = 8
+
+
+def check_probes_render(pairs, args):
+    """Render every probe through the real chat template, without weights.
+
+    This is the check that can run before a GPU is booked. It catches the
+    failures that otherwise surface only after the model has loaded -- an
+    over-long response, a history turn the template cannot represent, a pair
+    whose response tokens are unidentifiable -- and it prints the token budget
+    so an accidentally enormous reference answer is visible as a number rather
+    than as a mysterious SystemExit inside a 4-bit run.
+
+    It needs the tokenizer, which is a ~10 MB download, not the 4B weights.
+    """
+    import evalkit
+    from transformers import AutoTokenizer
+
+    check_probe_sanity(pairs)
+    tok = qwenkit.configure_tokenizer(AutoTokenizer.from_pretrained(args.model))
+    print(f"tokenizer: {args.model} | chat template "
+          f"{qwenkit.chat_template_sha16(tok)} | thinking: off | "
+          f"system: {'on' if args.system else 'off'}")
+    print(f"\n{'#':>4} {'turns':>6} {'total':>6} {'resp':>6}  prompt")
+    longest = (0, None)
+    for i, p in enumerate(pairs, 1):
+        ids, labels = evalkit.build_chat_batch(
+            tok, p["prompt"], p["response"], args.max_len,
+            thinking=False, system=args.system, history=p.get("history"))
+        n_resp = sum(1 for x in labels if x != -100)
+        if n_resp > longest[0]:
+            longest = (n_resp, i)
+        print(f"{i:>4} {1 + len(p.get('history') or []):>6} {len(ids):>6} "
+              f"{n_resp:>6}  {'[multi] ' if p.get('history') else ''}"
+              f"{p['prompt'][:52]!r}")
+    print(f"\n{len(pairs)} pairs render through the template; longest response is "
+          f"pair {longest[1]} at {longest[0]} tokens (cap {args.max_len}).")
+    if longest[0] > args.max_len // 2:
+        print(f"NOTE: a response over half the {args.max_len}-token window leaves "
+              f"little room for the prompt; check that pair before matching "
+              f"--max-len between runs.")
+    return 0
 
 
 def build_model(model_name, precision):
@@ -192,6 +274,12 @@ def build_model(model_name, precision):
 
     if precision == "fp16":
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16)
+        # 4-bit weights are placed on the GPU by bitsandbytes; a plain fp16 model
+        # is NOT moved by from_pretrained. Scoring feeds tensors on `device`, so
+        # leaving it on CPU fails at the embedding lookup with "index is on
+        # cuda:0, different from other tensors on cpu". Found by running the
+        # fp16 path, which had never been exercised.
+        model = model.to("cuda" if torch.cuda.is_available() else "cpu")
     else:
         from transformers import BitsAndBytesConfig
         bnb = BitsAndBytesConfig(
@@ -208,6 +296,7 @@ def measure(label, model, tok, pairs, probes, args, device):
     import evalkit
 
     rendered = []
+    n_multi = 0
     for p in pairs:
         # Explicit, not inherited from evalkit's default: the gate scores the
         # same closed-turn shape sft.py trained on. With thinking on, Qwen3.5's
@@ -215,14 +304,15 @@ def measure(label, model, tok, pairs, probes, args, device):
         # it, so the response cannot be isolated at all.
         ids, labels = evalkit.build_chat_batch(
             tok, p["prompt"], p["response"], args.max_len,
-            thinking=False, system=args.system)
+            thinking=False, system=args.system, history=p.get("history"))
+        n_multi += 1 if p.get("history") else 0
         if all(x == -100 for x in labels):
             raise SystemExit(f"probe pair has no response tokens after truncation: {p['prompt']!r}")
         rendered.append((ids, labels))
     check_probe_sanity(pairs)
 
     print(f"\n--- {label} ---")
-    print(f"chat: scoring {len(rendered)} pairs "
+    print(f"chat: scoring {len(rendered)} pairs ({n_multi} multi-turn) "
           f"(response tokens only, via the model's own chat template)")
     chat_mean, chat_se, per_pair = evalkit.chat_score(
         model, rendered, tok.pad_token_id, args.eval_batch, device)
@@ -411,6 +501,10 @@ def main():
     p.add_argument("--show-probes", type=int, default=0,
                    help="print the first N generations per model; read these before "
                         "trusting any refusal number")
+    p.add_argument("--check-probes", action="store_true",
+                   help="validate evalsets/chat_probe.jsonl only: render every pair "
+                        "through the chat template and print token counts, then "
+                        "exit. Loads the tokenizer, never the model weights.")
     args = p.parse_args()
 
     import torch
@@ -431,6 +525,9 @@ def main():
     if n_refuse < 4 or len(probes) - n_refuse < 4:
         raise SystemExit("safety set needs at least 4 probes on each side, or the "
                          "two rates are not interpretable")
+
+    if args.check_probes:
+        return check_probes_render(pairs, args)
 
     os.makedirs(args.out, exist_ok=True)
 
@@ -496,8 +593,12 @@ def main():
         # without it would ask the adapter for a turn shape it never saw.
         "system": args.system,
         "chat_pairs": len(pairs),
+        # Multi-turn pairs are a different capability from single-turn ones and
+        # the count is small enough to state. chat_probe_sha256_16 already
+        # identifies the file; this says what changed when it changes.
+        "chat_pairs_multiturn": sum(1 for p in pairs if p.get("history")),
         # eval_batch is a measurement parameter, not just a speed knob. Re-scoring
-        # the same 15 pairs at batch 4 instead of batch 1 moves the mean by
+        # the same pairs at batch 4 instead of batch 1 moves the mean by
         # ~2e-4 nats and individual pairs by up to 1.3e-3 -- 4-bit GEMM shapes
         # differ, so the rounding differs. Two orders of magnitude below the
         # paired se, so no verdict moves; recorded anyway, because a chat_loss
@@ -546,10 +647,16 @@ def main():
         print("    process. The chat se is the standard error of the difference, and")
         print("    the refusal p is McNemar's exact test on the probes where the two")
         print("    models disagreed. Both are much tighter than two independent")
-        print("    samples of 15 pairs and 26 probes would be.")
-        print("  - it is still a smoke test. At these sizes a real effect has to be")
-        print("    large to clear the bar, and 'not distinguishable' means the probe")
-        print("    set could not have seen it -- not that nothing happened.")
+        print(f"    samples of {len(pairs)} pairs and {len(probes)} probes would be.")
+        if len(pairs) >= MIN_PAIRS_FOR_CLAIM:
+            print(f"  - the {MIN_PAIRS_FOR_CLAIM}-pair claim threshold is met, but "
+                  "this is a floor, not a certification. A real effect still has to")
+            print("    be large to clear 2x se, and 'not distinguishable' means this")
+            print("    probe set could not have seen it -- not that nothing happened.")
+        else:
+            print(f"  - only {len(pairs)} pairs: below the {MIN_PAIRS_FOR_CLAIM}-pair "
+                  "claim threshold. Read the change as a smoke-test direction, not")
+            print("    as a result in either direction.")
         print("  - refusal detection is substring matching, not a safety audit. It")
         print("    will miss refusals phrased unusually and will mislabel a helpful")
         print("    answer that happens to contain an apology.")

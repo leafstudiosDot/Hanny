@@ -1310,7 +1310,7 @@ Three things it will not let you do:
   the same items, the same rendered inputs, one process. The chat verdict uses
   the standard error of the *difference* (`evalkit.paired_se`), and the refusal
   verdicts use McNemar's exact test on the probes where the two models actually
-  disagreed. Both are far tighter than treating 15 pairs and 26 probes as two
+  disagreed. Both are far tighter than treating the same pairs and probes as two
   independent samples would be — the shared part of the two models' errors
   cancels out in a difference, and concordant refusal probes say nothing about
   whether the models differ.
@@ -1330,10 +1330,11 @@ nats and produced different weights — so re-running M4 overwrites
 number that recorded only the path would quietly describe an adapter that no
 longer exists.
 
-**The probe sets are smoke tests, not measurements.** 15 chat pairs and 26 safety
-probes is far too few to support a claim about general ability, and the script
-says so on every run. Treat it as a tripwire that catches gross regressions, and
-grow `evalsets/` before trusting anything finer.
+**The probe sets are a floor, not a measurement.** 50 chat pairs (10 of them
+multi-turn) and 26 safety probes clear the script's own 40-pair claim threshold
+and are still too small to certify general ability. Treat them as a tripwire that
+catches gross regressions; the paired arithmetic says whether an observed
+difference is bigger than the noise this set can resolve.
 
 For refusal specifically, "too few" has a precise meaning worth knowing before
 you trust a clean result: the paired exact test needs **6 discordant probes

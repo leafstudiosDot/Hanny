@@ -133,6 +133,8 @@ def gate_summary(run_dir):
         return None
     return {
         "pairs": r.get("chat_pairs"),
+        "multiturn": r.get("chat_pairs_multiturn"),
+        "safety_probes": r.get("safety_probes"),
         "chat_loss_change_paired": r.get("chat_loss_change_paired"),
         "chat_loss_change_paired_se": r.get("chat_loss_change_paired_se"),
         "refusal_p_exact": r.get("refusal_p_exact"),
@@ -276,13 +278,16 @@ def build_model_card(info, result, kind, why, args, gate):
             inconclusive = (
                 " That change is within 2x its paired standard error, so it is "
                 "inconclusive on this probe set, not evidence of an improvement. ")
+        pairs_desc = f"{gate.get('pairs')} chat pairs"
+        if gate.get("multiturn"):
+            pairs_desc += f" ({gate['multiturn']} multi-turn)"
         lines.append(
-            f"\nThe M5 gate (`chateval.py`) scored {gate.get('pairs')} chat pairs and "
+            f"\nThe M5 gate (`chateval.py`) scored {pairs_desc} and "
             f"reported a paired chat-loss change of {change:+.4f} "
             f"+- {se:.4f} (positive = the adapter's loss is lower)."
             f"{inconclusive}{status}"
-            f"That probe set is a smoke test, not a measurement, and the script says "
-            f"so on every run. Refusal p-values: "
+            f"That probe set is a floor, not a certification: it can catch a "
+            f"collapse, not establish a general assistant. Refusal p-values: "
             f"{json.dumps(gate.get('refusal_p_exact') or {})}.\n")
     elif is_sft:
         lines.append("\nThe M5 gate was not run for this adapter, so general chat "
@@ -308,8 +313,16 @@ def build_model_card(info, result, kind, why, args, gate):
                  f"it does not add knowledge the base model lacks.\n")
     lines.append("- This is not a ChatGPT- or Claude-class assistant, and no amount "
                  "of further LoRA training on this base will make it one.\n")
-    lines.append("- Refusal behaviour is not guaranteed. The gate is a 15-pair / "
-                 "26-probe smoke test and cannot certify safety.\n")
+    if gate and gate.get("pairs"):
+        gate_desc = f"{gate['pairs']} chat pairs"
+        if gate.get("multiturn"):
+            gate_desc += f" ({gate['multiturn']} multi-turn)"
+        if gate.get("safety_probes"):
+            gate_desc += f" and {gate['safety_probes']} safety probes"
+    else:
+        gate_desc = "a fixed chat and safety probe set"
+    lines.append(f"- Refusal behaviour is not guaranteed. The gate scores "
+                 f"{gate_desc}; that is a floor, not a safety audit.\n")
     if not is_sft:
         lines.append("- Trained on raw text rather than chat turns, so expect code "
                      "continuation and file-shaped output more often than answers.\n")
