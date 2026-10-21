@@ -35,13 +35,15 @@
 /hanny-kaggle.zip
 /upload/
 
-# artifacts.zip -- the bundle Cell 8 produces on Kaggle and you download back.
+# artifacts.zip -- the bundle Cell 7 produces on Kaggle and you download back.
 # It carries adapter_model.safetensors, which .gitattributes would route to LFS,
-# so a `git add .` would push ~24 MB of weights to the LAN Gitea. The individual
-# files it expands into are already ignored (checkpoints/, *.safetensors), but
-# the zip itself is a loose file in the repo root and would not be.
-/artifacts.zip
-/m5-4b-artifacts.zip
+# so a `git add .` would push ~24 MB of weights to the LAN Gitea. It also carries
+# gate/result.json, whose per_probe rows are the private red-team phrasings that
+# hub_sync.py deliberately refuses to push. The individual files it expands into
+# are already ignored (checkpoints/, *.safetensors), but the zip itself is a loose
+# file in the repo root. Matched by suffix, not by run name: the enumerated list
+# had already fallen behind -- m5-4b-ddp-artifacts.zip was covered by nothing.
+/*artifacts.zip
 
 # pack.py's local allowance list. Gitignored because an allowance has to live
 # somewhere, and recording an accepted string in a tracked pack.py would put

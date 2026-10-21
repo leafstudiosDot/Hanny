@@ -432,6 +432,7 @@ def build_dataset(tok, args):
         "max_len": args.max_len,
         "system": None if args.no_system else args.system,
         "val_per_mille": args.val_per_mille,
+        "fit_steps": getattr(args, "fit_steps_meta", None),
         "sources": sources,
         "counts": counts,
         "conversations": {"train": len(train), "val": len(val)},
@@ -575,6 +576,117 @@ def write_resume_point(out, core_model, state):
     os.replace(tmp, os.path.join(out, "train_state.pt"))
 
 
+def pull_and_verify(args):
+    """Restore <run>/ from the private Hub and prove WHICH weights arrived.
+
+    Two different things go wrong here and a path cannot tell them apart:
+
+      1. the pull restores nothing, and `checkpoints/<run>` is empty. hub_sync.pull
+         returns False rather than raising, by design -- a network blip must never
+         kill a training run -- so the caller has to check;
+      2. the pull restores a DIFFERENT adapter under the same run name. That is
+         not hypothetical in this project: finetune.py is not bit-reproducible and
+         sft.py reuses `--run`, so two adapters have already lived under one
+         folder name (m4, and m5-4b-ddp). Resuming from the wrong one does not
+         crash -- it continues someone else's optimizer state into a run whose
+         numbers will then be attributed to this one.
+
+    Hashing the weights is the only check that separates (2) from success, so it
+    is what --expect-adapter-sha16 does. Both adapter-best and adapter-last may
+    legitimately differ (best is saved at the best eval, last at the final step),
+    so an expected value matches if ANY restored adapter matches it.
+
+    Returns a process exit code: 0 proven, 1 pulled-but-unproven, 2 nothing pulled.
+    """
+    import torch
+
+    if not args.hub_repo:
+        raise SystemExit("--pull needs --hub-repo (or $HANNY_HUB_REPO), the PRIVATE "
+                         "model repo the run was pushed to.")
+    ckpt_root = os.path.abspath(args.pull_into or os.path.join(HERE, "checkpoints"))
+    out = os.path.join(ckpt_root, args.run)
+    sync = hub_sync.HubSync(args.hub_repo, args.run)
+    if not sync.enabled:
+        print("no HF_TOKEN / HUGGINGFACE_HUB_TOKEN in the environment, so nothing "
+              "can be pulled.\nOn Kaggle the secret is attached in Cell 1b; "
+              "locally run: hf auth login")
+        return 2
+
+    print(f"pulling {args.run} from {args.hub_repo} into {out}/ ...")
+    have_state = sync.pull(ckpt_root)
+    print(f"  train_state.pt present: {have_state}")
+
+    adapters = [d for d in ("adapter-best", "adapter-last")
+                if os.path.isdir(os.path.join(out, d))]
+    if not adapters:
+        print(f"REFUSING: no adapter-best/ or adapter-last/ arrived in "
+              f"{os.path.relpath(out, HERE)}/. The repo is empty, private to "
+              f"another token, or holds a different run name.")
+        return 2
+    if not have_state:
+        print("  WARNING: no train_state.pt -- these adapters are usable and can be "
+              "verified,\n  but --resume has no optimizer state to continue from.")
+
+    found = {}
+    for name in adapters:
+        info = qwenkit.adapter_identity(os.path.join(out, name))
+        if "error" in info:
+            print(f"  {name:<13} UNREADABLE: {info['error']}")
+            continue
+        found[name] = info["sha256_16"]
+        print(f"  {name:<13} sha256[:16] {info['sha256_16']}  "
+              f"({info['bytes']/1e6:.1f} MB)")
+
+    result_path = os.path.join(out, "result.json")
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, encoding="utf-8-sig") as f:
+                r = json.load(f)
+            print(f"  result.json   run {r.get('run')!r} | steps_done "
+                  f"{r.get('steps_done')} | best_step {r.get('best_step')} | "
+                  f"loss_after {r.get('loss_after')} | gate_exit {r.get('gate_exit')}")
+        except (OSError, ValueError) as e:
+            print(f"  result.json   unreadable: {e}")
+    else:
+        print("  result.json   MISSING -- these weights have no recorded provenance")
+
+    state_path = os.path.join(out, "train_state.pt")
+    if os.path.exists(state_path):
+        try:
+            # Same guard as --resume: tensors and plain containers only.
+            state = torch.load(state_path, map_location="cpu", weights_only=True)
+            print(f"  train_state   step {state.get('step')} | "
+                  f"seconds {state.get('seconds')} | n_train "
+                  f"{state.get('meta', {}).get('n_train')}")
+        except Exception as e:  # noqa: BLE001 - a torn file must be reported, not hidden
+            print(f"  train_state   UNREADABLE ({e!r}); --resume would fail on it")
+
+    if not args.expect_adapter_sha16:
+        print("\nno --expect-adapter-sha16 given, so these weights are identified "
+              "but not verified against a known run.")
+        return 0
+
+    expected = {e.strip().lower() for e in args.expect_adapter_sha16 if e.strip()}
+    matched = {name: h for name, h in found.items() if h.lower() in expected}
+    if matched:
+        for name, h in matched.items():
+            print(f"\nVERIFIED: {args.run}/{name} is sha256[:16] {h}, one of the "
+                  f"expected adapters.")
+        return 0
+
+    print("\nADAPTER MISMATCH -- refusing to call this a restore of the run you asked "
+          "for.")
+    print(f"  expected one of: {', '.join(sorted(expected))}")
+    print(f"  found:           "
+          + (", ".join(f"{k}={v}" for k, v in found.items()) or "nothing readable"))
+    print("  The Hub holds a different adapter under this run name. Two adapters "
+          "have shared a\n  run name in this project before, so do not resolve this "
+          "by assuming the local\n  copy is stale. Either push the intended weights, "
+          "or pass the hash you actually\n  want. Adapters are identified by hash, "
+          "never by path or run name.")
+    return 1
+
+
 def run_gate(out, model_name, precision, system=None, env=None):
     """Run chateval.py against an existing run folder's adapter-best.
 
@@ -630,6 +742,13 @@ def main():
     p.add_argument("--max-per-source", type=int, default=20000,
                    help="rows taken per source; streaming reads the head of the "
                         "split, which the report records as sampling='head'")
+    p.add_argument("--fit-steps", action="store_true",
+                   help="lower --max-per-source so the data build costs minutes "
+                        "instead of an hour on a short run. Needs --max-steps; "
+                        "the cap is ~8 conversations per step per rank, split "
+                        "across sources so the mix survives. A --fit-steps run is "
+                        "NOT comparable with a full-data run -- the report records "
+                        "the cap.")
     p.add_argument("--limit-examples", type=int, default=0,
                    help="cap conversations before expansion; 0 = all kept rows")
     p.add_argument("--max-train-tokens", type=int, default=0, help="0 = no cap")
@@ -675,6 +794,19 @@ def main():
     p.add_argument("--gate-only", action="store_true",
                    help="run only the gate against checkpoints/<run>/adapter-best; "
                         "no data build, no training, and result.json is updated")
+    p.add_argument("--pull", action="store_true",
+                   help="restore <run>/ from --hub-repo into checkpoints/ and print "
+                        "the adapter weight hashes, without training. This is the "
+                        "restore half of a resume; --resume assumes it already ran.")
+    p.add_argument("--expect-adapter-sha16", action="append", default=[],
+                   metavar="HEX16",
+                   help="with --pull: exit non-zero unless at least one restored "
+                        "adapter's weights hash to one of these. Repeatable: "
+                        "adapter-best and adapter-last may legitimately differ.")
+    p.add_argument("--pull-into", default=None, metavar="DIR",
+                   help="with --pull: restore to DIR/<run>/ instead of "
+                        "checkpoints/<run>/. Verifying what the Hub holds and "
+                        "replacing your working copy are different actions.")
     p.add_argument("--ddp", action="store_true",
                    help="Distributed Data Parallel, one process per GPU. Launch "
                         "with: python -m torch.distributed.run --standalone "
@@ -697,6 +829,13 @@ def main():
                          "token batches, per-microbatch gradient scaling across "
                          "ranks would need a second all-reduce per step; not "
                          "implemented.")
+    if args.fit_steps and not args.max_steps:
+        # Checked here, before the tokenizer is even downloaded: a data cap needs
+        # a step budget to derive from, and without one it would be an arbitrary
+        # dataset change that no later reader could reconstruct.
+        raise SystemExit("--fit-steps needs --max-steps: the cap is derived from "
+                         "the step budget, and without one it would be an "
+                         "arbitrary dataset change.")
 
     ddp = bool(args.ddp)
     rank, world_size, local_rank = 0, 1, 0
@@ -732,6 +871,17 @@ def main():
             sys.stdout = open(os.devnull, "w")
         elif world_size == 1:
             print("note: WORLD_SIZE=1 -- DDP smoke path, not a speedup.")
+
+    if args.pull:
+        # Restore only: no data, no model, no GPU. Checked before the
+        # Kaggle-only training guard below, because pulling on a laptop is the
+        # normal way to look at what a session pushed.
+        if args.ddp:
+            raise SystemExit("--pull is a single-process restore; it does not train")
+        if args.gate_only or args.resume:
+            raise SystemExit("--pull restores the files; run --resume (or "
+                             "--gate-only) afterwards as its own command.")
+        return pull_and_verify(args)
 
     if args.gate_only:
         if args.ddp:
@@ -805,6 +955,41 @@ def main():
 
     out = os.path.join(HERE, "checkpoints", args.run)
     os.makedirs(out, exist_ok=True)
+
+    if args.fit_steps:
+        # A step budget that only consumes a few hundred examples does not need a
+        # 46-minute data build. This lowers --max-per-source (the row cap) to
+        # roughly what the steps can consume, split evenly across sources so the
+        # MIX survives -- capping by early exit instead would quietly train on the
+        # first source only.
+        #
+        # 8 conversations per optimizer step per rank. Measured: the M5 mix ran
+        # ~2.04 examples per conversation and ~3.7 examples per 2048-token batch
+        # on a rank, so 8 is roughly 2x the real need. The point is to be cheap,
+        # not to be tight.
+        n_sources = len(args.data) + len(args.from_hub)
+        if not n_sources:
+            raise SystemExit("--fit-steps has nothing to cap: no --data / --from-hub")
+        rows_wanted = args.max_steps * max(1, world_size) * 8
+        per_source = max(16, rows_wanted // n_sources)
+        capped = min(args.max_per_source or per_source, per_source)
+        print(f"\n--fit-steps: {args.max_steps:,} steps x world size "
+              f"{max(1, world_size)} -> ~{rows_wanted:,} rows over {n_sources} "
+              f"source(s) -> --max-per-source {capped:,} "
+              f"(from {args.max_per_source:,})")
+        if args.data:
+            print("  NOTE: local --data JSONL files are read whole; --fit-steps only "
+                  "caps\n  Hub sources. Keep a probe JSONL small instead.")
+        print("  This subset is NOT comparable with a full-data run: fewer rows "
+              "means a different\n  training set. It is for pipeline and "
+              "resume checks, which compare two runs built\n  the same way. The "
+              "cap is recorded in data_report.json and result.json.")
+        args.max_per_source = capped
+        args.fit_steps_meta = {"max_steps": args.max_steps,
+                               "world_size": max(1, world_size),
+                               "sources": n_sources,
+                               "rows_wanted": rows_wanted,
+                               "max_per_source": capped}
 
     state_path = os.path.join(out, "train_state.pt")
     sync = hub_sync.HubSync(args.hub_repo, args.run)
@@ -948,6 +1133,14 @@ def main():
         total_steps = min(total_steps, args.max_steps)
     print(f"\n{len(train):,} examples, mean {mean_len:.0f} tokens -> "
           f"~{approx_batch} per batch | {total_steps:,} optimizer steps")
+    if args.max_steps and total_steps < args.max_steps:
+        # Not fatal, but never silent: a run that stops short of its own budget
+        # is a run whose curve cannot be read against the one the budget was
+        # chosen for, and a resume matches `total_steps` in `meta`, not
+        # `--max-steps`.
+        print(f"  WARNING: --max-steps {args.max_steps:,} but this dataset only "
+              f"supports {total_steps:,} steps. Raise --fit-steps / "
+              f"--max-per-source, or the run stops early.")
 
     vocab = len(tok)
     logit_gb = args.max_tokens_per_batch * vocab * 2 / 1e9
@@ -1231,6 +1424,16 @@ def main():
             "loss_after": round(best_val, 6),
             "loss_change": round(-d, 6),
             "paired_se": round(se, 6),
+            # The per-example val losses behind loss_after. Without this array a
+            # run-vs-run difference cannot be PAIRED: paired_se needs the same
+            # items scored by both, and two runs' own val_se values are
+            # independent bounds. This is what makes "resumed vs uninterrupted"
+            # arithmetic on stored numbers instead of another GPU run. Empty
+            # means there was no best eval to record -- read that as "unpaired",
+            # not as "zero items".
+            "val_per_example": [round(float(x), 6) for x in (best_per_example or [])],
+            "val_per_mille": args.val_per_mille,
+            "fit_steps": report.get("fit_steps"),
             "precision": args.precision,
             "kernels": qwenkit.kernels(),
             "seed": args.seed,
