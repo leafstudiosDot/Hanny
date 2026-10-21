@@ -492,17 +492,29 @@ def mean_se(values):
             float(np.std(clean, ddof=1) / math.sqrt(len(clean))))
 
 
-def make_batches(n, lengths, max_tokens, rng):
+def make_batches(n, lengths, max_tokens, rng, pad_budget=False):
     """Group similar-length examples under a token cap, then shuffle batch order.
 
     Padding is wasted compute, and for SFT the waste is large: a mix of 30-token
     and 900-token conversations padded to the longest one per batch can spend
     most of its FLOPs on pad tokens.
+
+    The default cap counts REAL tokens (sum of lengths) and is what every
+    recorded training run used; do not change it for training, it would change
+    the batch order of every run. A batch is padded to its longest member, so
+    its memory cost is rows x longest, which can be ~2x the cap when neighbouring
+    lengths are far apart. On a dense set (the training split) that gap is
+    negligible; on a small sparse one (the 128 val examples) it is not, and it
+    OOMed the base-model scoring on a T4. pad_budget=True caps rows x longest
+    instead, so the padded batch always fits the cap (one example longer than
+    the cap still gets its own batch). Scoring uses it; training does not.
     """
     order = sorted(range(n), key=lambda i: lengths[i])
     batches, cur, used = [], [], 0
     for i in order:
-        if cur and used + lengths[i] > max_tokens:
+        # `order` is ascending, so lengths[i] is the longest member once added.
+        cost = (len(cur) + 1) * lengths[i] if pad_budget else used + lengths[i]
+        if cur and cost > max_tokens:
             batches.append(cur)
             cur, used = [], 0
         cur.append(i)
@@ -538,7 +550,7 @@ def score_examples(model, examples, pad_id, max_tokens, device):
     import torch.nn.functional as F
 
     batches = make_batches(len(examples), [len(e[0]) for e in examples],
-                           max_tokens, np.random.default_rng(0))
+                           max_tokens, np.random.default_rng(0), pad_budget=True)
     out = [float("nan")] * len(examples)
     with torch.no_grad():
         for b in batches:
